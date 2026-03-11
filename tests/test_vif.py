@@ -137,13 +137,10 @@ def test_vif_non_numeric_raises():
 
 def test_vif_matches_statsmodels():
     """Test VIF output matches statsmodels implementation."""
-    try:
-        import statsmodels.api as sm
-        from statsmodels.stats.outliers_influence import (
-            variance_inflation_factor as sm_vif_func,
-        )
-    except ImportError:
-        pytest.skip("statsmodels not installed")
+    sm = pytest.importorskip("statsmodels.api")
+    from statsmodels.stats.outliers_influence import (
+        variance_inflation_factor as sm_vif_func,
+    )
 
     np.random.seed(42)
     n = 1000
