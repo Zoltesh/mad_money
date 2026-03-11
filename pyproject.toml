@@ -1,0 +1,47 @@
+[project]
+name = "mad-money"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "ccxt>=4.5.42",
+    "polars>=1.38.1",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.lint]
+# Enable pycodestyle (E), pyflakes (F), isort (I), pydocstyle (D), pep8-naming (N)
+select = ["E", "F", "I", "D", "N", "W", "UP"]
+ignore = [
+    "E501",     # Line too long (handled by formatter)
+    "D105",     # Missing docstring in magic method
+    "D106",     # Missing docstring in public nested class
+    "D107",     # Missing docstring in __init__
+    "D205",     # 1 blank line required between summary line and description
+    "D400",     # First line should be in imperative mood
+    "D401",     # First line should be in imperative mood
+    "D415",     # First line should end with a period
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mad_money"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+# Use the formatter for code style (Black-compatible)
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.5",
+    "ty>=0.0.21",
+]
