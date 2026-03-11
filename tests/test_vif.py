@@ -1,5 +1,7 @@
 """Tests for variance_inflation_factor function."""
 
+import time
+
 import numpy as np
 import polars as pl
 import pytest
@@ -171,8 +173,6 @@ def test_vif_matches_statsmodels():
 
 def test_vif_performance_benchmark():
     """Benchmark VIF performance."""
-    import time
-
     np.random.seed(42)
     n = 5000
     k = 50
