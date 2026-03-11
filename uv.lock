@@ -289,6 +289,7 @@ name = "mad-money"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "ccxt" },
     { name = "polars" },
 ]
@@ -301,6 +302,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.13.3" },
     { name = "ccxt", specifier = ">=4.5.42" },
     { name = "polars", specifier = ">=1.38.1" },
 ]

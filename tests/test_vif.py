@@ -10,7 +10,7 @@ from statsmodels.stats.outliers_influence import (
     variance_inflation_factor as sm_vif_func,
 )
 
-from mad_money.stats.vif import variance_inflation_factor
+from src.stats.vif import variance_inflation_factor
 
 
 def test_vif_basic():
