@@ -1,4 +1,7 @@
+"""Nothing yet"""
+
 def main():
+    """Does nothing"""
     print("Hello from mad-money!")
 
 
