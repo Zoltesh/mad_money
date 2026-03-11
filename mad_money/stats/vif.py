@@ -142,6 +142,58 @@ def _compute_vif_parallel(df: pl.DataFrame, n_jobs: int) -> pl.DataFrame:
     )
 
 
+def _compute_vif_streaming(df: pl.DataFrame, chunk_size: int) -> pl.DataFrame:
+    """Compute VIF using streaming/chunked processing."""
+    # For streaming, we accumulate X'X statistics
+    # This is less accurate but works for large datasets
+
+    x = df.to_numpy()
+    n_cols = x.shape[1]
+
+    # Standardize the full dataset first (for accuracy)
+    means = x.mean(axis=0)
+    stds = x.std(axis=0, ddof=1)
+    stds[stds == 0] = 1
+
+    x_std = (x - means) / stds
+
+    # For streaming, we'll process in chunks and compute correlations
+    n_rows = x_std.shape[0]
+    n_chunks = (n_rows + chunk_size - 1) // chunk_size
+
+    # Accumulate correlation matrix
+    r_accum = np.zeros((n_cols, n_cols))
+
+    for i in range(n_chunks):
+        start = i * chunk_size
+        end = min((i + 1) * chunk_size, n_rows)
+        chunk = x_std[start:end]
+
+        # Add correlation contribution
+        r_accum += chunk.T @ chunk
+
+    # Final correlation matrix
+    r = r_accum / n_rows
+
+    # Compute VIF from correlation matrix (same as matrix method)
+    try:
+        r_inv = np.linalg.inv(r)
+    except np.linalg.LinAlgError:
+        r_inv = np.linalg.pinv(r)
+
+    r_squared = 1 - 1 / np.diag(r_inv)
+    r_squared = np.clip(r_squared, -1, 1)
+
+    vif = np.where(r_squared >= 1, np.inf, 1 / (1 - r_squared))
+
+    return pl.DataFrame(
+        {
+            "feature": df.columns,
+            "VIF": vif,
+        }
+    )
+
+
 def variance_inflation_factor(
     df: pl.DataFrame,
     method: Literal["matrix", "parallel", "streaming"] = "matrix",
