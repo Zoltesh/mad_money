@@ -131,3 +131,64 @@ def test_vif_non_numeric_raises():
 
     with pytest.raises(ValueError, match="non-numeric"):
         variance_inflation_factor(df)
+
+
+def test_vif_matches_statsmodels():
+    """Test VIF output matches statsmodels implementation."""
+    try:
+        import statsmodels.api as sm
+        from statsmodels.stats.outliers_influence import variance_inflation_factor
+    except ImportError:
+        pytest.skip("statsmodels not installed")
+
+    np.random.seed(42)
+    n = 1000
+    k = 10
+
+    # Create correlated data
+    x = np.random.randn(n, k)
+    x[:, 1] = x[:, 0] * 0.8 + x[:, 2] * 0.3  # Add correlation
+    x[:, 3] = x[:, 1] * 0.9
+
+    df = pl.DataFrame({f"x{i}": x[:, i] for i in range(k)})
+
+    # Our VIF
+    result = variance_inflation_factor(df, method="matrix").sort("feature")
+
+    # Statsmodels VIF
+    x_df = sm.add_constant(x[:, 1:])  # Exclude constant
+    sm_vif = [variance_inflation_factor(x_df, i) for i in range(x_df.shape[1])]
+
+    # Compare (excluding intercept)
+    our_vif = result["VIF"].to_numpy()[1:]
+
+    np.testing.assert_allclose(our_vif, sm_vif, rtol=1e-5)
+
+
+def test_vif_performance_benchmark():
+    """Benchmark VIF performance."""
+    import time
+
+    np.random.seed(42)
+    n = 5000
+    k = 50
+
+    x = np.random.randn(n, k)
+    df = pl.DataFrame({f"x{i}": x[:, i] for i in range(k)})
+
+    # Time matrix method
+    start = time.perf_counter()
+    variance_inflation_factor(df, method="matrix")
+    matrix_time = time.perf_counter() - start
+
+    # Time parallel method
+    start = time.perf_counter()
+    variance_inflation_factor(df, method="parallel", n_jobs=4)
+    parallel_time = time.perf_counter() - start
+
+    print(f"\nMatrix method: {matrix_time:.4f}s")
+    print(f"Parallel method (4 jobs): {parallel_time:.4f}s")
+
+    # Just ensure it runs in reasonable time (< 5 seconds)
+    assert matrix_time < 5.0
+    assert parallel_time < 5.0
