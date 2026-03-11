@@ -6,11 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **mad-money** is a high-performance crypto analysis library built with Polars for fast numerical computation. It provides statistical tools for analyzing cryptocurrency market data.
 
+## Quick Start
+
+```bash
+uv sync          # Install all dependencies
+pytest           # Run tests
+```
+
 ## Common Commands
 
 ```bash
-# Run all tests
-pytest
+# Install dependencies (including dev)
+uv sync --group dev
 
 # Run a specific test file
 pytest tests/test_vif.py
@@ -40,17 +47,35 @@ uv sync --group dev
 ## Architecture
 
 ```
-mad_money/
+src/
 ├── __init__.py           # Package entry point, exports main APIs
-└── stats/
-    ├── __init__.py       # Stats module exports
-    └── vif.py           # Variance Inflation Factor implementation
+├── stats/
+│   ├── __init__.py       # Stats module exports
+│   └── vif.py           # Variance Inflation Factor implementation
+└── data/
+    ├── __init__.py       # Data module exports
+    └── ohlcv.py         # OHLCV data retrieval from Coinbase (planned)
 ```
 
 The project is organized by domain:
-- `mad_money/stats/` - Statistical analysis tools (VIF currently implemented)
+- `src/stats/` - Statistical analysis tools (VIF currently implemented)
+- `src/data/` - Data retrieval (OHLCV from Coinbase - in development)
 
-### VIF Module (`mad_money/stats/vif.py`)
+### OHLCV Data Module (`src/data/ohlcv.py`)
+
+Planned module for retrieving OHLCV (candlestick) data from Coinbase via ccxt.
+See `docs/plans/2026-03-11-ohlcv-design.md` for full design.
+
+| Method | Purpose |
+|--------|---------|
+| `fetch(symbol, timeframe, start_date, end_date)` | Fetch historical OHLCV by date range |
+| `fetch_latest(symbol, timeframe)` | Fetch only new candles since last stored |
+| `save(df, symbol, timeframe)` | Save DataFrame to parquet |
+| `load(symbol, timeframe, year, month)` | Load from parquet |
+| `update(symbol, timeframe)` | Load existing + fetch latest + overwrite |
+| `fetch_multiple(symbols, timeframes, ...)` | Batch fetch with concurrency |
+
+### VIF Module (`src/stats/vif.py`)
 
 Three computation methods available:
 - **matrix** (default): Fastest - uses correlation matrix inversion
