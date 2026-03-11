@@ -1,5 +1,6 @@
 """Variance Inflation Factor (VIF) module for Polars."""
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
@@ -123,8 +124,6 @@ def _compute_vif_parallel(df: pl.DataFrame, n_jobs: int) -> pl.DataFrame:
     n_cols = x.shape[1]
 
     if n_jobs == -1:
-        import os
-
         n_workers = os.cpu_count() or 4
     else:
         n_workers = max(1, n_jobs)
@@ -222,12 +221,8 @@ def variance_inflation_factor(
     if method == "matrix":
         result = _compute_vif_matrix(df)
     elif method == "parallel":
-        from mad_money.stats.vif import _compute_vif_parallel
-
         result = _compute_vif_parallel(df, n_jobs)
     elif method == "streaming":
-        from mad_money.stats.vif import _compute_vif_streaming
-
         result = _compute_vif_streaming(df, chunk_size)
     else:
         raise ValueError(f"Unknown method: {method}")
