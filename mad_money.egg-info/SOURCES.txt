@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+mad_money/__init__.py
+mad_money.egg-info/PKG-INFO
+mad_money.egg-info/SOURCES.txt
+mad_money.egg-info/dependency_links.txt
+mad_money.egg-info/requires.txt
+mad_money.egg-info/top_level.txt
+mad_money/stats/__init__.py
+mad_money/stats/vif.py
+tests/test_vif.py
