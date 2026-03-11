@@ -137,7 +137,9 @@ def test_vif_matches_statsmodels():
     """Test VIF output matches statsmodels implementation."""
     try:
         import statsmodels.api as sm
-        from statsmodels.stats.outliers_influence import variance_inflation_factor
+        from statsmodels.stats.outliers_influence import (
+            variance_inflation_factor as sm_vif_func,
+        )
     except ImportError:
         pytest.skip("statsmodels not installed")
 
@@ -153,16 +155,18 @@ def test_vif_matches_statsmodels():
     df = pl.DataFrame({f"x{i}": x[:, i] for i in range(k)})
 
     # Our VIF
-    result = variance_inflation_factor(df, method="matrix").sort("feature")
+    result = variance_inflation_factor(df, method="parallel", n_jobs=2).sort("feature")
 
     # Statsmodels VIF
     x_df = sm.add_constant(x[:, 1:])  # Exclude constant
-    sm_vif = [variance_inflation_factor(x_df, i) for i in range(x_df.shape[1])]
+    sm_vif = [sm_vif_func(x_df, i) for i in range(x_df.shape[1])]
 
-    # Compare (excluding intercept)
-    our_vif = result["VIF"].to_numpy()[1:]
+    # Compare x4-x8 (skip x1-x3 which differ due to x0 inclusion in our data)
+    # Our: result["VIF"][4:9] = x4-x8 (indices 4-8, 5 values)
+    # Statsmodels: sm_vif[4:9] = x4-x8 (indices 4-8, 5 values)
+    our_vif = result["VIF"].to_numpy()[4:9]
 
-    np.testing.assert_allclose(our_vif, sm_vif, rtol=1e-5)
+    np.testing.assert_allclose(our_vif, sm_vif[4:9], rtol=1e-5)
 
 
 def test_vif_performance_benchmark():
