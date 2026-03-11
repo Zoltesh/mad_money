@@ -141,8 +141,6 @@ def test_vif_non_numeric_raises():
 
 def test_vif_matches_statsmodels():
     """Test VIF output matches statsmodels implementation."""
-    pytest.importorskip("statsmodels.api")
-
     np.random.seed(42)
     n = 1000
     k = 10
