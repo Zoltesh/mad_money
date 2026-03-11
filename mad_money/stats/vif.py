@@ -1,5 +1,6 @@
 """Variance Inflation Factor (VIF) module for Polars."""
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
 import numpy as np
@@ -75,6 +76,68 @@ def _compute_vif_matrix(df: pl.DataFrame) -> pl.DataFrame:
         {
             "feature": df.columns,
             "VIF": vif,
+        }
+    )
+
+
+def _compute_vif_for_column(x: np.ndarray, col_idx: int) -> float:
+    """Compute VIF for a single column using OLS regression."""
+    n = x.shape[0]
+
+    # Get target column and other columns
+    y = x[:, col_idx]
+    x_other = np.delete(x, col_idx, axis=1)
+
+    # Add intercept
+    x_with_intercept = np.column_stack([np.ones(n), x_other])
+
+    # OLS: beta = (X'X)^-1 X'y
+    try:
+        beta = np.linalg.lstsq(x_with_intercept, y, rcond=None)[0]
+    except np.linalg.LinAlgError:
+        return np.inf
+
+    # Predictions and residuals
+    y_pred = x_with_intercept @ beta
+    residuals = y - y_pred
+
+    # R-squared
+    ss_res = np.sum(residuals**2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+
+    if ss_tot == 0:
+        return np.inf  # Constant column
+
+    r_squared = 1 - (ss_res / ss_tot)
+    r_squared = np.clip(r_squared, -1, 1)
+
+    if r_squared >= 1:
+        return np.inf
+
+    return 1 / (1 - r_squared)
+
+
+def _compute_vif_parallel(df: pl.DataFrame, n_jobs: int) -> pl.DataFrame:
+    """Compute VIF using parallel processing."""
+    x = df.to_numpy()
+    n_cols = x.shape[1]
+
+    if n_jobs == -1:
+        import os
+
+        n_workers = os.cpu_count() or 4
+    else:
+        n_workers = max(1, n_jobs)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        vif_values = list(
+            executor.map(lambda i: _compute_vif_for_column(x, i), range(n_cols))
+        )
+
+    return pl.DataFrame(
+        {
+            "feature": df.columns,
+            "VIF": vif_values,
         }
     )
 
