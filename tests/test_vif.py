@@ -5,6 +5,10 @@ import time
 import numpy as np
 import polars as pl
 import pytest
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import (
+    variance_inflation_factor as sm_vif_func,
+)
 
 from mad_money.stats.vif import variance_inflation_factor
 
@@ -137,10 +141,7 @@ def test_vif_non_numeric_raises():
 
 def test_vif_matches_statsmodels():
     """Test VIF output matches statsmodels implementation."""
-    sm = pytest.importorskip("statsmodels.api")
-    from statsmodels.stats.outliers_influence import (
-        variance_inflation_factor as sm_vif_func,
-    )
+    pytest.importorskip("statsmodels.api")
 
     np.random.seed(42)
     n = 1000
