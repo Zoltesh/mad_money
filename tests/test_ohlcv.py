@@ -442,3 +442,80 @@ def test_load_with_year_month_filter(tmp_path):
     empty_data = client.load("BTC/USD", "1h", year=2025, month=12)
     assert len(empty_data) == 0
     assert isinstance(empty_data, pl.DataFrame)
+
+
+def test_fetch_multiple_returns_dict():
+    """Test that fetch_multiple returns correct nested dict structure."""
+    client = CoinbaseDataClient()
+
+    # Mock candles with timestamps
+    mock_candles = [
+        [1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],  # 2024-01-01 00:00
+        [1704067260000, 42050.0, 42150.0, 42000.0, 42100.0, 800.0],  # 2024-01-01 00:01
+    ]
+
+    async def mock_fetch(*args, **kwargs):
+        return mock_candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch
+        mock_exchange.return_value = mock_exchange_instance
+
+        # Test with multiple symbols and timeframes
+        result = asyncio.run(
+            client.fetch_multiple(
+                symbols=["BTC/USD", "ETH/USD"],
+                timeframes=["1m", "1h"],
+                start_date="2024-01-01",
+            )
+        )
+
+    # Verify nested dict structure
+    assert isinstance(result, dict)
+    assert "BTC/USD" in result
+    assert "ETH/USD" in result
+
+    assert isinstance(result["BTC/USD"], dict)
+    assert "1m" in result["BTC/USD"]
+    assert "1h" in result["BTC/USD"]
+
+    assert isinstance(result["ETH/USD"], dict)
+    assert "1m" in result["ETH/USD"]
+    assert "1h" in result["ETH/USD"]
+
+    # Verify each entry is a DataFrame with correct columns
+    for symbol in result:
+        for timeframe in result[symbol]:
+            df = result[symbol][timeframe]
+            assert isinstance(df, pl.DataFrame)
+            assert df.columns == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+def test_fetch_multiple_empty_results():
+    """Test that fetch_multiple handles empty results correctly."""
+    client = CoinbaseDataClient()
+
+    # Mock returning empty candles
+    async def mock_fetch(*args, **kwargs):
+        return []
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch
+        mock_exchange.return_value = mock_exchange_instance
+
+        result = asyncio.run(
+            client.fetch_multiple(
+                symbols=["BTC/USD"],
+                timeframes=["1m"],
+                start_date="2024-01-01",
+            )
+        )
+
+    # Should still return dict structure with empty DataFrames
+    assert isinstance(result, dict)
+    assert "BTC/USD" in result
+    assert isinstance(result["BTC/USD"], dict)
+    assert "1m" in result["BTC/USD"]
+    assert result["BTC/USD"]["1m"].is_empty()

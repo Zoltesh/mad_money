@@ -463,3 +463,47 @@ class CoinbaseDataClient:
         combined_df = combined_df.unique(subset=["timestamp"], keep="first")
 
         return combined_df
+
+    async def fetch_multiple(
+        self,
+        symbols: list[str],
+        timeframes: list[str],
+        start_date: str,
+        end_date: str | None = None,
+    ) -> dict[str, dict[str, pl.DataFrame]]:
+        """Fetch OHLCV data for multiple symbols and timeframes concurrently.
+
+        Args:
+            symbols: List of trading pair symbols (e.g., ["BTC/USD", "ETH/USD"]).
+            timeframes: List of timeframes (e.g., ["1m", "1h"]).
+            start_date: Start date for data retrieval.
+            end_date: End date for data retrieval. Defaults to latest.
+
+        Returns:
+            Nested dict: {symbol: {timeframe: DataFrame}}
+        """
+
+        # Build list of all fetch tasks
+        async def fetch_one(
+            symbol: str, timeframe: str
+        ) -> tuple[str, str, pl.DataFrame]:
+            df = await self.fetch(symbol, timeframe, start_date, end_date)
+            return (symbol, timeframe, df)
+
+        # Create all tasks
+        tasks = []
+        for symbol in symbols:
+            for timeframe in timeframes:
+                tasks.append(fetch_one(symbol, timeframe))
+
+        # Run all concurrently
+        results = await asyncio.gather(*tasks)
+
+        # Build nested dict structure
+        result_dict: dict[str, dict[str, pl.DataFrame]] = {}
+        for symbol, timeframe, df in results:
+            if symbol not in result_dict:
+                result_dict[symbol] = {}
+            result_dict[symbol][timeframe] = df
+
+        return result_dict
