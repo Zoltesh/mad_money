@@ -17,6 +17,7 @@ dependencies = [
     "polars>=1.38.1",
     "numpy>=2.0.0",
     "jupyterlab>=4.5.6",
+    "pydantic-settings>=2.7.1",
 ]
 
 [tool.uv]
