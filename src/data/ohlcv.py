@@ -33,6 +33,8 @@ class CoinbaseDataClient:
         data_dir: str = "./data",
         max_concurrency: int = 10,
         rate_limit_backoff: float = 1.0,
+        api_key: str | None = None,
+        private_key: str | None = None,
     ) -> None:
         """Initialize the Coinbase data client.
 
@@ -40,17 +42,46 @@ class CoinbaseDataClient:
             data_dir: Directory for storing fetched data.
             max_concurrency: Maximum number of concurrent requests.
             rate_limit_backoff: Backoff time in seconds for rate limiting.
+            api_key: Optional Coinbase API key for authenticated requests.
+            private_key: Optional Coinbase private key (PEM format) for authenticated requests.
         """
         self.data_dir = data_dir
         self.max_concurrency = max_concurrency
         self.rate_limit_backoff = rate_limit_backoff
+        self._api_key = api_key
+        self._private_key = private_key
         self._exchange: ccxt.async_support.coinbaseadvanced | None = None
         self._semaphore: asyncio.Semaphore | None = None
+
+    @classmethod
+    def from_settings(cls, settings, **kwargs) -> "CoinbaseDataClient":
+        """Create a CoinbaseDataClient from a settings object.
+
+        Args:
+            settings: Settings object with coinbase_api_key and coinbase_private_key.
+            **kwargs: Additional arguments to pass to the constructor.
+
+        Returns:
+            CoinbaseDataClient instance with credentials from settings.
+        """
+        return cls(
+            api_key=settings.coinbase_api_key,
+            private_key=settings.coinbase_private_key,
+            **kwargs,
+        )
 
     def _get_exchange(self) -> ccxt.async_support.coinbaseadvanced:
         """Get or create the ccxt exchange instance."""
         if self._exchange is None:
-            self._exchange = ccxt.async_support.coinbaseadvanced()
+            if self._api_key and self._private_key:
+                self._exchange = ccxt.async_support.coinbaseadvanced(
+                    {
+                        "apiKey": self._api_key,
+                        "secret": self._private_key,
+                    }
+                )
+            else:
+                self._exchange = ccxt.async_support.coinbaseadvanced()
         return self._exchange
 
     def _get_semaphore(self) -> asyncio.Semaphore:
