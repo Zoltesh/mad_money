@@ -91,11 +91,12 @@ class CoinbaseDataClient:
         return self._semaphore
 
     @staticmethod
-    def _parse_date(date_str: str) -> datetime:
+    def _parse_date(date_str: str, end_of_day: bool = False) -> datetime:
         """Parse date string to datetime.
 
         Args:
             date_str: Date string in various formats.
+            end_of_day: If True and date has no time component, set time to 23:59:59.999.
 
         Returns:
             datetime object in UTC.
@@ -103,7 +104,17 @@ class CoinbaseDataClient:
         # Try parsing as ISO format first
         try:
             dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+            dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+            # If no time component and end_of_day=True, set to end of day
+            if (
+                end_of_day
+                and dt.hour == 0
+                and dt.minute == 0
+                and dt.second == 0
+                and dt.microsecond == 0
+            ):
+                dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+            return dt
         except ValueError:
             pass
 
@@ -117,6 +128,15 @@ class CoinbaseDataClient:
         for fmt in formats:
             try:
                 dt = datetime.strptime(date_str, fmt)
+                # If no time component and end_of_day=True, set to end of day
+                if (
+                    end_of_day
+                    and dt.hour == 0
+                    and dt.minute == 0
+                    and dt.second == 0
+                    and dt.microsecond == 0
+                ):
+                    dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
                 return dt.replace(tzinfo=UTC)
             except ValueError:
                 continue
@@ -166,7 +186,7 @@ class CoinbaseDataClient:
         start_ts = int(self._parse_date(start_date).timestamp() * 1000)
         end_ts = None
         if end_date:
-            end_ts = int(self._parse_date(end_date).timestamp() * 1000)
+            end_ts = int(self._parse_date(end_date, end_of_day=True).timestamp() * 1000)
 
         all_candles: list[list[float]] = []
         since = start_ts
