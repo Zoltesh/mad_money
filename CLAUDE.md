@@ -33,7 +33,7 @@ uv run ty .
 
 ## Development Dependencies
 
-Install via `uv` or pip with the dev group:
+Install via `uv` with the dev group:
 ```bash
 uv sync --group dev
 ```

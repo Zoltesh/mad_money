@@ -1,3 +1,13 @@
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "mad-money"
 version = "0.1.0"
@@ -8,6 +18,7 @@ dependencies = [
     "aiohttp>=3.13.3",
     "ccxt>=4.5.42",
     "polars>=1.38.1",
+    "numpy>=2.0.0",
 ]
 
 [tool.ruff]
@@ -29,7 +40,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["mad_money"]
+known-first-party = ["src"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
@@ -43,6 +54,8 @@ line-ending = "auto"
 
 [dependency-groups]
 dev = [
+    "pytest>=9.0.2",
+    "statsmodels>=0.14.0",
     "ruff>=0.15.5",
     "ty>=0.0.21",
 ]

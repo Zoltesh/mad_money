@@ -31,8 +31,8 @@ git commit -m "feat: add aiohttp dependency for async ccxt"
 ## Task 2: Create Module Structure
 
 **Files:**
-- Create: `mad_money/data/__init__.py`
-- Create: `mad_money/data/ohlcv.py`
+- Create: `src/data/__init__.py`
+- Create: `src/data/ohlcv.py`
 
 **Step 1: Write the failing test**
 
@@ -45,13 +45,13 @@ from polars import DataFrame
 
 def test_client_import():
     """Test that CoinbaseDataClient can be imported."""
-    from mad_money.data import CoinbaseDataClient
+    from src.data import CoinbaseDataClient
     assert CoinbaseDataClient is not None
 
 
 def test_schema_import():
     """Test that OHLCV_SCHEMA can be imported."""
-    from mad_money.data.ohlcv import OHLCV_SCHEMA
+    from src.data.ohlcv import OHLCV_SCHEMA
     assert OHLCV_SCHEMA is not None
     assert "timestamp" in OHLCV_SCHEMA
     assert "open" in OHLCV_SCHEMA
@@ -68,17 +68,17 @@ Expected: FAIL with "cannot import name"
 
 **Step 3: Write minimal implementation**
 
-Create `mad_money/data/__init__.py`:
+Create `src/data/__init__.py`:
 
 ```python
 """Data module for OHLCV data retrieval and storage."""
 
-from mad_money.data.ohlcv import CoinbaseDataClient, OHLCV_SCHEMA
+from src.data.ohlcv import CoinbaseDataClient, OHLCV_SCHEMA
 
 __all__ = ["CoinbaseDataClient", "OHLCV_SCHEMA"]
 ```
 
-Create `mad_money/data/ohlcv.py`:
+Create `src/data/ohlcv.py`:
 
 ```python
 """OHLCV data retrieval from Coinbase."""
@@ -118,7 +118,7 @@ Expected: PASS
 **Step 5: Commit**
 
 ```bash
-git add mad_money/data/ tests/test_ohlcv.py
+git add src/data/ tests/test_ohlcv.py
 git commit -m "feat: create OHLCV module structure with CoinbaseDataClient"
 ```
 
@@ -127,7 +127,7 @@ git commit -m "feat: create OHLCV module structure with CoinbaseDataClient"
 ## Task 3: Implement Fetch with Pagination
 
 **Files:**
-- Modify: `mad_money/data/ohlcv.py`
+- Modify: `src/data/ohlcv.py`
 
 **Step 1: Write the failing test**
 
@@ -140,7 +140,7 @@ from unittest.mock import AsyncMock, patch
 
 def test_fetch_returns_dataframe():
     """Test that fetch returns a Polars DataFrame."""
-    from mad_money.data import CoinbaseDataClient
+    from src.data import CoinbaseDataClient
 
     client = CoinbaseDataClient()
     result = asyncio.run(client.fetch("BTC-USDC", "1h", "2025-01-01", "2025-01-02"))
@@ -151,7 +151,7 @@ def test_fetch_returns_dataframe():
 
 def test_fetch_respects_date_range():
     """Test that fetch respects start and end dates."""
-    from mad_money.data import CoinbaseDataClient
+    from src.data import CoinbaseDataClient
 
     client = CoinbaseDataClient()
     result = asyncio.run(client.fetch("BTC-USDC", "1h", "2025-01-01", "2025-01-02"))
@@ -170,7 +170,7 @@ Expected: FAIL with "AttributeError: 'CoinbaseDataClient' object has no attribut
 
 **Step 3: Write minimal implementation**
 
-Update `mad_money/data/ohlcv.py`:
+Update `src/data/ohlcv.py`:
 
 ```python
 """OHLCV data retrieval from Coinbase."""
@@ -347,7 +347,7 @@ Expected: PASS (or FAIL if no network - that's OK)
 **Step 5: Commit**
 
 ```bash
-git add mad_money/data/ohlcv.py tests/test_ohlcv.py
+git add src/data/ohlcv.py tests/test_ohlcv.py
 git commit -m "feat: implement fetch with pagination in CoinbaseDataClient"
 ```
 
@@ -356,7 +356,7 @@ git commit -m "feat: implement fetch with pagination in CoinbaseDataClient"
 ## Task 4: Implement Save Method
 
 **Files:**
-- Modify: `mad_money/data/ohlcv.py`
+- Modify: `src/data/ohlcv.py`
 
 **Step 1: Write the failing test**
 
@@ -369,7 +369,7 @@ import tempfile
 
 def test_save_creates_parquet(tmp_path):
     """Test that save creates a parquet file."""
-    from mad_money.data import CoinbaseDataClient
+    from src.data import CoinbaseDataClient
 
     client = CoinbaseDataClient(data_dir=str(tmp_path))
 
@@ -392,7 +392,7 @@ def test_save_creates_parquet(tmp_path):
 
 def test_save_correct_directory_structure(tmp_path):
     """Test that save creates correct directory structure."""
-    from mad_money.data import CoinbaseDataClient
+    from src.data import CoinbaseDataClient
 
     client = CoinbaseDataClient(data_dir=str(tmp_path))
 
@@ -418,7 +418,7 @@ Expected: FAIL with "AttributeError: 'CoinbaseDataClient' object has no attribut
 
 **Step 3: Write minimal implementation**
 
-Add to `mad_money/data/ohlcv.py`:
+Add to `src/data/ohlcv.py`:
 
 ```python
 def _get_file_path(self, symbol: str, timeframe: str, timestamp: datetime) -> Path:
@@ -495,7 +495,7 @@ Expected: PASS
 **Step 5: Commit**
 
 ```bash
-git add mad_money/data/ohlcv.py tests/test_ohlcv.py
+git add src/data/ohlcv.py tests/test_ohlcv.py
 git commit -m "feat: implement save method for parquet storage"
 ```
 
@@ -504,7 +504,7 @@ git commit -m "feat: implement save method for parquet storage"
 ## Task 5: Implement Load Method
 
 **Files:**
-- Modify: `mad_money/data/ohlcv.py`
+- Modify: `src/data/ohlcv.py`
 
 **Step 1: Write the failing test**
 
@@ -513,7 +513,7 @@ Add to `tests/test_ohlcv.py`:
 ```python
 def test_load_parquet(tmp_path):
     """Test loading parquet files."""
-    from mad_money.data import CoinbaseDataClient
+    from src.data import CoinbaseDataClient
 
     client = CoinbaseDataClient(data_dir=str(tmp_path))
 
@@ -538,7 +538,7 @@ def test_load_parquet(tmp_path):
 
 def test_load_with_year_month_filter(tmp_path):
     """Test loading with year/month filter."""
-    from mad_money.data import CoinbaseDataClient
+    from src.data import CoinbaseDataClient
 
     client = CoinbaseDataClient(data_dir=str(tmp_path))
 
@@ -566,7 +566,7 @@ Expected: FAIL with "AttributeError"
 
 **Step 3: Write minimal implementation**
 
-Add to `mad_money/data/ohlcv.py`:
+Add to `src/data/ohlcv.py`:
 
 ```python
 def load(
@@ -629,7 +629,7 @@ Expected: PASS
 **Step 5: Commit**
 
 ```bash
-git add mad_money/data/ohlcv.py tests/test_ohlcv.py
+git add src/data/ohlcv.py tests/test_ohlcv.py
 git commit -m "feat: implement load method for reading parquet files"
 ```
 
@@ -638,7 +638,7 @@ git commit -m "feat: implement load method for reading parquet files"
 ## Task 6: Implement fetch_latest and update Methods
 
 **Files:**
-- Modify: `mad_money/data/ohlcv.py`
+- Modify: `src/data/ohlcv.py`
 
 **Step 1: Write the failing test**
 
@@ -647,7 +647,7 @@ Add to `tests/test_ohlcv.py`:
 ```python
 def test_fetch_latest_returns_only_new(tmp_path):
     """Test that fetch_latest returns only new candles."""
-    from mad_money.data import CoinbaseDataClient
+    from src.data import CoinbaseDataClient
 
     client = CoinbaseDataClient(data_dir=str(tmp_path))
 
@@ -676,7 +676,7 @@ Expected: FAIL with "AttributeError"
 
 **Step 3: Write minimal implementation**
 
-Add to `mad_money/data/ohlcv.py`:
+Add to `src/data/ohlcv.py`:
 
 ```python
 async def fetch_latest(
@@ -781,7 +781,7 @@ Expected: PASS
 **Step 5: Commit**
 
 ```bash
-git add mad_money/data/ohlcv.py tests/test_ohlcv.py
+git add src/data/ohlcv.py tests/test_ohlcv.py
 git commit -m "feat: implement fetch_latest and update methods"
 ```
 
@@ -790,7 +790,7 @@ git commit -m "feat: implement fetch_latest and update methods"
 ## Task 7: Implement fetch_multiple for Batch Operations
 
 **Files:**
-- Modify: `mad_money/data/ohlcv.py`
+- Modify: `src/data/ohlcv.py`
 
 **Step 1: Write the failing test**
 
@@ -799,7 +799,7 @@ Add to `tests/test_ohlcv.py`:
 ```python
 def test_fetch_multiple_returns_dict():
     """Test that fetch_multiple returns dict of DataFrames."""
-    from mad_money.data import CoinbaseDataClient
+    from src.data import CoinbaseDataClient
 
     client = CoinbaseDataClient()
 
@@ -823,7 +823,7 @@ Expected: FAIL with "AttributeError"
 
 **Step 3: Write minimal implementation**
 
-Add to `mad_money/data/ohlcv.py`:
+Add to `src/data/ohlcv.py`:
 
 ```python
 async def fetch_multiple(
@@ -889,7 +889,7 @@ Expected: PASS
 **Step 5: Commit**
 
 ```bash
-git add mad_money/data/ohlcv.py tests/test_ohlcv.py
+git add src/data/ohlcv.py tests/test_ohlcv.py
 git commit -m "feat: implement fetch_multiple for batch operations"
 ```
 
@@ -898,7 +898,7 @@ git commit -m "feat: implement fetch_multiple for batch operations"
 ## Task 8: Add Context Manager Support
 
 **Files:**
-- Modify: `mad_money/data/ohlcv.py`
+- Modify: `src/data/ohlcv.py`
 
 **Step 1: Write the failing test**
 
@@ -918,7 +918,7 @@ Expected: FAIL with "TypeError"
 
 **Step 3: Write minimal implementation**
 
-Add to `CoinbaseDataClient` class in `mad_money/data/ohlcv.py`:
+Add to `CoinbaseDataClient` class in `src/data/ohlcv.py`:
 
 ```python
 async def __aenter__(self):
@@ -952,7 +952,7 @@ Expected: PASS
 **Step 5: Commit**
 
 ```bash
-git add mad_money/data/ohlcv.py tests/test_ohlcv.py
+git add src/data/ohlcv.py tests/test_ohlcv.py
 git commit -m "feat: add context manager support to CoinbaseDataClient"
 ```
 
@@ -971,7 +971,7 @@ Add to `tests/test_ohlcv.py`:
 @pytest.mark.integration
 def test_full_workflow_integration(tmp_path):
     """Integration test: fetch, save, load, update workflow."""
-    from mad_money.data import CoinbaseDataClient
+    from src.data import CoinbaseDataClient
 
     client = CoinbaseDataClient(data_dir=str(tmp_path))
 
@@ -1002,17 +1002,17 @@ git commit -m "test: add integration test for full workflow"
 ## Task 10: Update Module Exports
 
 **Files:**
-- Modify: `mad_money/data/__init__.py`
+- Modify: `src/data/__init__.py`
 
 **Step 1: Verify exports are correct**
 
-Run: `python -c "from mad_money.data import CoinbaseDataClient, OHLCV_SCHEMA; print('OK')"`
+Run: `python -c "from src.data import CoinbaseDataClient, OHLCV_SCHEMA; print('OK')"`
 Expected: OK
 
 **Step 2: Commit**
 
 ```bash
-git add mad_money/data/__init__.py
+git add src/data/__init__.py
 git commit -m "chore: verify module exports"
 ```
 
@@ -1021,8 +1021,8 @@ git commit -m "chore: verify module exports"
 ## Summary
 
 **Files Created:**
-- `mad_money/data/__init__.py`
-- `mad_money/data/ohlcv.py`
+- `src/data/__init__.py`
+- `src/data/ohlcv.py`
 - `tests/test_ohlcv.py`
 
 **Files Modified:**
