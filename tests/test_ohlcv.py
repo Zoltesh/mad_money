@@ -229,3 +229,75 @@ def test_save_correct_directory_structure(tmp_path):
     assert len(feb_df) == 1
     assert jan_df["timestamp"][0].month == 1
     assert feb_df["timestamp"][0].month == 2
+
+
+def test_load_parquet(tmp_path):
+    """Test that load method reads saved parquet files."""
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+
+    # Create and save sample OHLCV data
+    save_df = pl.DataFrame(
+        {
+            "timestamp": [datetime(2025, 1, 15, 10, 0, tzinfo=UTC)],
+            "open": [42000.0],
+            "high": [42100.0],
+            "low": [41900.0],
+            "close": [42050.0],
+            "volume": [1000.0],
+        }
+    )
+    client.save(save_df, "BTC/USD", "1h")
+
+    # Load the data
+    loaded_df = client.load("BTC/USD", "1h")
+
+    # Verify data was loaded correctly
+    assert isinstance(loaded_df, pl.DataFrame)
+    assert len(loaded_df) == 1
+    assert loaded_df["close"][0] == 42050.0
+    assert loaded_df.columns == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+def test_load_with_year_month_filter(tmp_path):
+    """Test loading with year and month filters."""
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+
+    # Create and save sample OHLCV data spanning multiple months
+    save_df = pl.DataFrame(
+        {
+            "timestamp": [
+                datetime(2025, 1, 15, 10, 0, tzinfo=UTC),
+                datetime(2025, 2, 20, 15, 0, tzinfo=UTC),
+                datetime(2025, 3, 10, 20, 0, tzinfo=UTC),
+            ],
+            "open": [42000.0, 43000.0, 44000.0],
+            "high": [42100.0, 43100.0, 44100.0],
+            "low": [41900.0, 42900.0, 43900.0],
+            "close": [42050.0, 43050.0, 44050.0],
+            "volume": [1000.0, 800.0, 600.0],
+        }
+    )
+    client.save(save_df, "BTC/USD", "1h")
+
+    # Test loading all data
+    all_data = client.load("BTC/USD", "1h")
+    assert len(all_data) == 3
+
+    # Test loading by year only (should get all months for that year)
+    year_data = client.load("BTC/USD", "1h", year=2025)
+    assert len(year_data) == 3
+
+    # Test loading by year and month (January)
+    jan_data = client.load("BTC/USD", "1h", year=2025, month=1)
+    assert len(jan_data) == 1
+    assert jan_data["timestamp"][0].month == 1
+
+    # Test loading by year and month (February)
+    feb_data = client.load("BTC/USD", "1h", year=2025, month=2)
+    assert len(feb_data) == 1
+    assert feb_data["timestamp"][0].month == 2
+
+    # Test loading non-existent month returns empty
+    empty_data = client.load("BTC/USD", "1h", year=2025, month=12)
+    assert len(empty_data) == 0
+    assert isinstance(empty_data, pl.DataFrame)

@@ -270,3 +270,86 @@ class CoinbaseDataClient:
         if self._exchange:
             await self._exchange.close()
             self._exchange = None
+
+    def load(
+        self,
+        symbol: str,
+        timeframe: str,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> pl.DataFrame:
+        """Load OHLCV data from partitioned parquet files.
+
+        Args:
+            symbol: Trading pair symbol (e.g., "BTC/USD").
+            timeframe: Timeframe for candles (e.g., "1m", "1h").
+            year: Optional year to filter by.
+            month: Optional month to filter by (requires year).
+
+        Returns:
+            Polars DataFrame with OHLCV data.
+
+        Raises:
+            ValueError: If month is specified without year.
+        """
+        # Validate month without year
+        if month is not None and year is None:
+            raise ValueError("year must be specified when month is provided")
+
+        # Validate month range
+        if month is not None and (month < 1 or month > 12):
+            raise ValueError(f"month must be between 1 and 12, got {month}")
+
+        # Normalize symbol to path-friendly format
+        pair_path = symbol.replace("/", "-").lower()
+
+        # Build base path
+        base_path = Path(self.data_dir) / "coinbase" / "ohlcv" / pair_path / timeframe
+
+        # If no base directory exists, return empty DataFrame
+        if not base_path.exists():
+            return pl.DataFrame(schema=OHLCV_SCHEMA)
+
+        # Collect all parquet files to read
+        parquet_files: list[Path] = []
+
+        if year is not None:
+            # Look in specific year directory
+            year_path = base_path / str(year)
+            if year_path.exists():
+                parquet_files = list(year_path.glob("*.parquet"))
+        else:
+            # No year specified - scan all year directories
+            for year_dir in base_path.iterdir():
+                if year_dir.is_dir():
+                    parquet_files.extend(year_dir.glob("*.parquet"))
+
+        if not parquet_files:
+            return pl.DataFrame(schema=OHLCV_SCHEMA)
+
+        # Filter by month if specified
+        if month is not None:
+            month_str = f"{month:02d}.parquet"
+            parquet_files = [f for f in parquet_files if f.name == month_str]
+
+            if not parquet_files:
+                return pl.DataFrame(schema=OHLCV_SCHEMA)
+
+        # Read and combine all parquet files
+        dfs = []
+        for file_path in sorted(parquet_files):
+            df = pl.read_parquet(file_path)
+            dfs.append(df)
+
+        if not dfs:
+            return pl.DataFrame(schema=OHLCV_SCHEMA)
+
+        combined_df = pl.concat(dfs)
+
+        # Sort by timestamp
+        combined_df = combined_df.sort("timestamp")
+
+        # Remove duplicates based on timestamp
+        combined_df = combined_df.unique(subset=["timestamp"], keep="first")
+
+        return combined_df
