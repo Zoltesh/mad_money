@@ -568,3 +568,88 @@ def test_sync_context_manager():
         assert ctx is client
 
     assert close_called, "close() should be called on sync context exit"
+
+
+@pytest.mark.integration
+def test_full_workflow_integration(tmp_path):
+    """Integration test covering full fetch-save-load-update workflow.
+
+    This test validates end-to-end functionality:
+    1. Fetch historical data
+    2. Save to parquet
+    3. Load from parquet
+    4. Update with new data
+    """
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+
+    # Mock data for initial fetch
+    ts_1 = int(datetime(2025, 1, 15, 10, 0, tzinfo=UTC).timestamp() * 1000)
+    ts_2 = int(datetime(2025, 1, 15, 10, 5, tzinfo=UTC).timestamp() * 1000)
+    ts_3 = int(datetime(2025, 1, 15, 10, 10, tzinfo=UTC).timestamp() * 1000)
+    ts_4 = int(datetime(2025, 1, 15, 10, 15, tzinfo=UTC).timestamp() * 1000)
+
+    mock_candles = [
+        [ts_1, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],
+        [ts_2, 42050.0, 42150.0, 41950.0, 42100.0, 800.0],
+        [ts_3, 42100.0, 42200.0, 42000.0, 42150.0, 600.0],
+    ]
+
+    # Step 1: Fetch historical data
+    async def mock_fetch(*args, **kwargs):
+        return mock_candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch
+        mock_exchange.return_value = mock_exchange_instance
+
+        fetched_df = asyncio.run(
+            client.fetch("BTC/USD", "5m", "2025-01-15", "2025-01-15T12:00:00")
+        )
+
+    # Verify fetch returns valid data
+    assert isinstance(fetched_df, pl.DataFrame)
+    assert len(fetched_df) == 3
+    assert fetched_df.columns == ["timestamp", "open", "high", "low", "close", "volume"]
+
+    # Step 2: Save data to parquet
+    client.save(fetched_df, "BTC/USD", "5m")
+
+    # Verify parquet file was created
+    parquet_path = (
+        tmp_path / "coinbase" / "ohlcv" / "btc-usd" / "5m" / "2025" / "01.parquet"
+    )
+    assert parquet_path.exists(), "Parquet file should be created"
+
+    # Step 3: Load data from parquet
+    loaded_df = client.load("BTC/USD", "5m", year=2025, month=1)
+
+    # Verify loaded data matches saved data
+    assert isinstance(loaded_df, pl.DataFrame)
+    assert len(loaded_df) == 3
+    assert loaded_df["close"].to_list() == [42050.0, 42100.0, 42150.0]
+
+    # Step 4: Update with new data (fetch latest and merge)
+    mock_new_candles = [
+        [ts_3, 42100.0, 42200.0, 42000.0, 42150.0, 600.0],  # Duplicate
+        [ts_4, 42150.0, 42250.0, 42100.0, 42200.0, 500.0],  # New
+    ]
+
+    async def mock_fetch_new(*args, **kwargs):
+        return mock_new_candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch_new
+        mock_exchange.return_value = mock_exchange_instance
+
+        updated_df = client.update("BTC/USD", "5m")
+
+    # Verify update merged and deduplicated correctly
+    assert isinstance(updated_df, pl.DataFrame)
+    assert len(updated_df) == 4, "Should have 4 rows after update (3 original + 1 new)"
+    assert updated_df["timestamp"].is_sorted(), "Data should be sorted by timestamp"
+
+    # Final verification: load again to confirm persistence
+    final_loaded = client.load("BTC/USD", "5m", year=2025, month=1)
+    assert len(final_loaded) == 4, "Updated data should be persisted"
