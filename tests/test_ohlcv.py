@@ -60,11 +60,152 @@ def test_supported_timeframes():
     assert SUPPORTED_TIMEFRAMES == expected
 
 
-def test_client_has_fetch_method():
-    """Test that CoinbaseDataClient has fetch method."""
+def test_fetch_latest_returns_only_new(tmp_path):
+    """Test that fetch_latest returns only new candles not already stored."""
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+
+    # First, save some existing data
+    existing_df = pl.DataFrame(
+        {
+            "timestamp": [
+                datetime(2025, 1, 15, 10, 0, tzinfo=UTC),
+                datetime(2025, 1, 15, 10, 5, tzinfo=UTC),
+                datetime(2025, 1, 15, 10, 10, tzinfo=UTC),
+            ],
+            "open": [42000.0, 42050.0, 42100.0],
+            "high": [42100.0, 42150.0, 42200.0],
+            "low": [41900.0, 41950.0, 42000.0],
+            "close": [42050.0, 42100.0, 42150.0],
+            "volume": [1000.0, 800.0, 600.0],
+        }
+    )
+    client.save(existing_df, "BTC/USD", "5m")
+
+    # Get existing timestamps to exclude
+    exclude_timestamps = existing_df["timestamp"].to_list()
+
+    # Mock fetch_latest to return some overlapping and some new data
+    # Use UTC-aware datetimes for creating timestamps to ensure consistent timezone handling
+    ts_10_10 = int(datetime(2025, 1, 15, 10, 10, tzinfo=UTC).timestamp() * 1000)
+    ts_10_15 = int(datetime(2025, 1, 15, 10, 15, tzinfo=UTC).timestamp() * 1000)
+    ts_10_20 = int(datetime(2025, 1, 15, 10, 20, tzinfo=UTC).timestamp() * 1000)
+
+    mock_candles = [
+        [ts_10_10, 42100.0, 42200.0, 42000.0, 42150.0, 600.0],  # Already stored
+        [ts_10_15, 42150.0, 42250.0, 42100.0, 42200.0, 500.0],  # New
+        [ts_10_20, 42200.0, 42300.0, 42150.0, 42250.0, 400.0],  # New
+    ]
+
+    async def mock_fetch(*args, **kwargs):
+        return mock_candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch
+        mock_exchange.return_value = mock_exchange_instance
+
+        # Call fetch_latest with exclude_timestamps
+        result = asyncio.run(
+            client.fetch_latest("BTC/USD", "5m", exclude_timestamps=exclude_timestamps)
+        )
+
+    # Should return only the 2 new candles (filtering out already stored)
+    assert len(result) == 2
+    # Verify the timestamps are the new ones
+    timestamps = result["timestamp"].to_list()
+    expected_ts_1 = datetime(2025, 1, 15, 10, 15, tzinfo=UTC)
+    expected_ts_2 = datetime(2025, 1, 15, 10, 20, tzinfo=UTC)
+    assert expected_ts_1 in timestamps
+    assert expected_ts_2 in timestamps
+
+
+def test_fetch_latest_returns_dataframe():
+    """Test that fetch_latest returns a Polars DataFrame with correct schema."""
     client = CoinbaseDataClient()
-    assert hasattr(client, "fetch")
-    assert callable(client.fetch)
+
+    mock_candles = [
+        [1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],
+        [1704067260000, 42050.0, 42150.0, 42000.0, 42100.0, 800.0],
+    ]
+
+    async def mock_fetch(*args, **kwargs):
+        return mock_candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch
+        mock_exchange.return_value = mock_exchange_instance
+
+        result = asyncio.run(client.fetch_latest("BTC/USD", "1m"))
+
+    assert isinstance(result, pl.DataFrame)
+    assert result.columns == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+def test_update_combines_and_deduplicates(tmp_path):
+    """Test that update correctly combines and deduplicates data."""
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+
+    # Save existing data
+    existing_df = pl.DataFrame(
+        {
+            "timestamp": [
+                datetime(2025, 1, 15, 10, 0, tzinfo=UTC),
+                datetime(2025, 1, 15, 10, 5, tzinfo=UTC),
+            ],
+            "open": [42000.0, 42050.0],
+            "high": [42100.0, 42150.0],
+            "low": [41900.0, 41950.0],
+            "close": [42050.0, 42100.0],
+            "volume": [1000.0, 800.0],
+        }
+    )
+    client.save(existing_df, "BTC/USD", "5m")
+
+    # Mock fetch_latest to return overlapping and new data
+    # Use UTC-aware datetimes for consistent timezone handling
+    ts_10_05 = int(datetime(2025, 1, 15, 10, 5, tzinfo=UTC).timestamp() * 1000)
+    ts_10_10 = int(datetime(2025, 1, 15, 10, 10, tzinfo=UTC).timestamp() * 1000)
+    ts_10_15 = int(datetime(2025, 1, 15, 10, 15, tzinfo=UTC).timestamp() * 1000)
+
+    mock_candles = [
+        [ts_10_05, 42050.0, 42150.0, 41950.0, 42100.0, 800.0],  # Duplicate
+        [ts_10_10, 42100.0, 42200.0, 42000.0, 42150.0, 600.0],  # New
+        [ts_10_15, 42150.0, 42250.0, 42100.0, 42200.0, 500.0],  # New
+    ]
+
+    async def mock_fetch(*args, **kwargs):
+        return mock_candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch
+        mock_exchange.return_value = mock_exchange_instance
+
+        result = client.update("BTC/USD", "5m")
+
+    # Should have 4 total rows (2 existing + 2 new, deduplicated)
+    assert len(result) == 4
+    # Should be sorted by timestamp
+    assert result["timestamp"].is_sorted()
+
+    # Verify saved file has correct data
+    loaded = client.load("BTC/USD", "5m")
+    assert len(loaded) == 4
+
+
+def test_client_has_fetch_latest_method():
+    """Test that CoinbaseDataClient has fetch_latest method."""
+    client = CoinbaseDataClient()
+    assert hasattr(client, "fetch_latest")
+    assert callable(client.fetch_latest)
+
+
+def test_client_has_update_method():
+    """Test that CoinbaseDataClient has update method."""
+    client = CoinbaseDataClient()
+    assert hasattr(client, "update")
+    assert callable(client.update)
 
 
 def test_client_validate_timeframe():

@@ -265,6 +265,116 @@ class CoinbaseDataClient:
             else:
                 partition_df.drop(["year", "month"]).write_parquet(file_path)
 
+    async def fetch_latest(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 300,
+        exclude_timestamps: list[datetime] | None = None,
+    ) -> pl.DataFrame:
+        """Fetch the latest OHLCV candles from Coinbase.
+
+        Args:
+            symbol: Trading pair symbol (e.g., "BTC/USD").
+            timeframe: Timeframe for candles (e.g., "1m", "5m", "1h").
+            limit: Number of candles to fetch. Defaults to 300.
+            exclude_timestamps: Optional list of timestamps to exclude from results.
+
+        Returns:
+            Polars DataFrame with OHLCV columns.
+
+        Raises:
+            ValueError: If timeframe is not supported.
+        """
+        self._validate_timeframe(timeframe)
+
+        exchange = self._get_exchange()
+        semaphore = self._get_semaphore()
+
+        # Fetch latest candles without date range
+        async with semaphore:
+            try:
+                candles = await exchange.fetch_ohlcv(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    limit=limit,
+                )
+            except ccxt.RateLimitExceeded:
+                await asyncio.sleep(self.rate_limit_backoff)
+                candles = await exchange.fetch_ohlcv(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    limit=limit,
+                )
+            except Exception:
+                raise
+
+        if not candles:
+            return pl.DataFrame(schema=OHLCV_SCHEMA)
+
+        # Convert to Polars DataFrame
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime.fromtimestamp(c[0] / 1000, tz=UTC) for c in candles
+                ],
+                "open": [c[1] for c in candles],
+                "high": [c[2] for c in candles],
+                "low": [c[3] for c in candles],
+                "close": [c[4] for c in candles],
+                "volume": [c[5] for c in candles],
+            },
+            schema=OHLCV_SCHEMA,
+        )
+
+        # Filter out excluded timestamps if provided
+        if exclude_timestamps:
+            df = df.filter(~pl.col("timestamp").is_in(exclude_timestamps))
+
+        return df
+
+    def update(self, symbol: str, timeframe: str) -> pl.DataFrame:
+        """Update stored OHLCV data with latest candles.
+
+        Loads existing data, fetches the latest candles, combines them,
+        removes duplicates, and saves back to storage.
+
+        Args:
+            symbol: Trading pair symbol (e.g., "BTC/USD").
+            timeframe: Timeframe for candles (e.g., "1m", "1h").
+
+        Returns:
+            Polars DataFrame with the updated OHLCV data.
+        """
+        # Load existing data
+        existing_df = self.load(symbol, timeframe)
+
+        # Get existing timestamps to exclude
+        exclude_timestamps = (
+            existing_df["timestamp"].to_list() if not existing_df.is_empty() else None
+        )
+
+        # Fetch latest candles (run the async method)
+        latest_df = asyncio.run(
+            self.fetch_latest(symbol, timeframe, exclude_timestamps=exclude_timestamps)
+        )
+
+        if existing_df.is_empty():
+            combined_df = latest_df
+        elif latest_df.is_empty():
+            combined_df = existing_df
+        else:
+            # Combine and deduplicate
+            combined_df = pl.concat([existing_df, latest_df])
+            combined_df = combined_df.unique(subset=["timestamp"], keep="last")
+            combined_df = combined_df.sort("timestamp")
+
+        # Save the combined data
+        if not combined_df.is_empty():
+            self.save(combined_df, symbol, timeframe)
+
+        return combined_df
+
     async def close(self) -> None:
         """Close the exchange connection."""
         if self._exchange:
