@@ -18,3 +18,6 @@ __pycache__/
 
 # Project specific
 tasks/
+bugs/
+docs/
+data/
