@@ -381,6 +381,26 @@ class CoinbaseDataClient:
             await self._exchange.close()
             self._exchange = None
 
+    # Async context manager support
+    async def __aenter__(self) -> "CoinbaseDataClient":
+        """Async context manager entry - initializes exchange connection."""
+        self._get_exchange()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Async context manager exit - ensures connection is closed."""
+        await self.close()
+
+    # Sync context manager support
+    def __enter__(self) -> "CoinbaseDataClient":
+        """Sync context manager entry - initializes exchange connection."""
+        self._get_exchange()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Sync context manager exit - ensures connection is closed."""
+        asyncio.run(self.close())
+
     def load(
         self,
         symbol: str,

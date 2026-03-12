@@ -519,3 +519,52 @@ def test_fetch_multiple_empty_results():
     assert isinstance(result["BTC/USD"], dict)
     assert "1m" in result["BTC/USD"]
     assert result["BTC/USD"]["1m"].is_empty()
+
+
+def test_async_context_manager():
+    """Test async context manager support."""
+    client = CoinbaseDataClient()
+
+    # Track if close was called
+    close_called = False
+
+    async def mock_close():
+        nonlocal close_called
+        close_called = True
+        client._exchange = None
+
+    # Set up mock exchange directly on the client
+    mock_exchange_instance = AsyncMock()
+    mock_exchange_instance.close = mock_close
+    client._exchange = mock_exchange_instance
+
+    async def run_test():
+        async with client as ctx:
+            assert ctx is client
+        return close_called
+
+    close_was_called = asyncio.run(run_test())
+
+    assert close_was_called, "close() should be called on async context exit"
+
+
+def test_sync_context_manager():
+    """Test sync context manager support."""
+    client = CoinbaseDataClient()
+
+    # Track if close was called
+    close_called = False
+
+    async def mock_close():
+        nonlocal close_called
+        close_called = True
+
+    # Set up mock exchange directly on the client
+    mock_exchange_instance = AsyncMock()
+    mock_exchange_instance.close = mock_close
+    client._exchange = mock_exchange_instance
+
+    with client as ctx:
+        assert ctx is client
+
+    assert close_called, "close() should be called on sync context exit"
