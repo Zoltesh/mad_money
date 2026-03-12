@@ -1,7 +1,7 @@
 """Tests for OHLCV module."""
 
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import polars as pl
@@ -155,3 +155,77 @@ def test_fetch_respects_date_range():
     assert result["timestamp"][0] <= datetime(
         2024, 1, 1, 0, 1, 0, tzinfo=result["timestamp"][0].tzinfo
     )
+
+
+def test_save_creates_parquet(tmp_path):
+    """Test that save method creates parquet file."""
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+
+    # Create sample OHLCV data
+    df = pl.DataFrame(
+        {
+            "timestamp": [datetime(2025, 1, 15, 10, 0, tzinfo=UTC)],
+            "open": [42000.0],
+            "high": [42100.0],
+            "low": [41900.0],
+            "close": [42050.0],
+            "volume": [1000.0],
+        }
+    )
+
+    # Save the data
+    client.save(df, "BTC/USD", "1h")
+
+    # Verify parquet file was created
+    expected_path = (
+        tmp_path / "coinbase" / "ohlcv" / "btc-usd" / "1h" / "2025" / "01.parquet"
+    )
+    assert expected_path.exists()
+
+    # Verify data was saved correctly
+    loaded_df = pl.read_parquet(expected_path)
+    assert len(loaded_df) == 1
+    assert loaded_df["close"][0] == 42050.0
+
+
+def test_save_correct_directory_structure(tmp_path):
+    """Test that save creates correct directory structure."""
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+
+    # Create sample OHLCV data spanning multiple months
+    df = pl.DataFrame(
+        {
+            "timestamp": [
+                datetime(2025, 1, 15, 10, 0, tzinfo=UTC),
+                datetime(2025, 2, 20, 15, 0, tzinfo=UTC),
+            ],
+            "open": [42000.0, 43000.0],
+            "high": [42100.0, 43100.0],
+            "low": [41900.0, 42900.0],
+            "close": [42050.0, 43050.0],
+            "volume": [1000.0, 800.0],
+        }
+    )
+
+    # Save the data
+    client.save(df, "BTC/USD", "1h")
+
+    # Verify directory structure
+    jan_path = (
+        tmp_path / "coinbase" / "ohlcv" / "btc-usd" / "1h" / "2025" / "01.parquet"
+    )
+    feb_path = (
+        tmp_path / "coinbase" / "ohlcv" / "btc-usd" / "1h" / "2025" / "02.parquet"
+    )
+
+    assert jan_path.exists()
+    assert feb_path.exists()
+
+    # Verify correct data in each file
+    jan_df = pl.read_parquet(jan_path)
+    feb_df = pl.read_parquet(feb_path)
+
+    assert len(jan_df) == 1
+    assert len(feb_df) == 1
+    assert jan_df["timestamp"][0].month == 1
+    assert feb_df["timestamp"][0].month == 2

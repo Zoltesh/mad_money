@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
 
 import ccxt
 import ccxt.async_support
@@ -195,6 +196,74 @@ class CoinbaseDataClient:
         )
 
         return df
+
+    def save(
+        self,
+        df: pl.DataFrame,
+        symbol: str,
+        timeframe: str,
+    ) -> None:
+        """Save OHLCV data to partitioned parquet files.
+
+        Args:
+            df: Polars DataFrame with OHLCV data.
+            symbol: Trading pair symbol (e.g., "BTC/USD").
+            timeframe: Timeframe for candles (e.g., "1m", "1h").
+
+        Raises:
+            ValueError: If DataFrame is empty or missing required columns.
+        """
+        # Handle empty DataFrame
+        if df.is_empty():
+            return
+
+        # Validate required columns
+        required_cols = {"timestamp", "open", "high", "low", "close", "volume"}
+        df_cols = set(df.columns)
+        if not required_cols.issubset(df_cols):
+            missing = required_cols - df_cols
+            raise ValueError(f"DataFrame missing required columns: {missing}")
+
+        # Normalize symbol to path-friendly format (e.g., BTC/USD -> btc-usd)
+        pair_path = symbol.replace("/", "-").lower()
+
+        # Extract year and month for partitioning
+        df_with_partition = df.with_columns(
+            [
+                pl.col("timestamp").dt.year().alias("year"),
+                pl.col("timestamp").dt.month().alias("month"),
+            ]
+        )
+
+        # Group by year-month and save each partition
+        for (year, month), partition_df in df_with_partition.group_by(
+            ["year", "month"]
+        ):
+            # Build directory path
+            dir_path = (
+                Path(self.data_dir)
+                / "coinbase"
+                / "ohlcv"
+                / pair_path
+                / timeframe
+                / str(year)
+            )
+            dir_path.mkdir(parents=True, exist_ok=True)
+
+            # Build file path
+            file_path = dir_path / f"{month:02d}.parquet"
+
+            # Load existing data if file exists and append with deduplication
+            if file_path.exists():
+                existing_df = pl.read_parquet(file_path)
+                # Combine and remove duplicates based on timestamp
+                combined_df = pl.concat(
+                    [existing_df, partition_df.drop(["year", "month"])]
+                )
+                combined_df = combined_df.unique(subset=["timestamp"], keep="first")
+                combined_df.write_parquet(file_path)
+            else:
+                partition_df.drop(["year", "month"]).write_parquet(file_path)
 
     async def close(self) -> None:
         """Close the exchange connection."""

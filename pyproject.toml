@@ -10,17 +10,21 @@ name = "mad-money"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = [
     "aiohttp>=3.13.3",
     "ccxt>=4.5.42",
     "polars>=1.38.1",
     "numpy>=2.0.0",
+    "jupyterlab>=4.5.6",
 ]
+
+[tool.uv]
+environments = ["python_full_version >= '3.13'"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py314"
+target-version = "py313"
 
 [tool.ruff.lint]
 # Enable pycodestyle (E), pyflakes (F), isort (I), pydocstyle (D), pep8-naming (N)
