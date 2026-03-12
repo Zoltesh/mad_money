@@ -43,6 +43,7 @@ uv sync --group dev
 - **Linter/Formatter**: ruff (pyproject.toml configured for Python 3.14+)
 - **Line length**: 88 characters
 - **Docstring convention**: Google style
+- **Imports**: All imports must be at the top of the file (no inline imports)
 
 ## Architecture
 
