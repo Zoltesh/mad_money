@@ -12,6 +12,7 @@ import polars as pl
 from rich.progress import Progress
 
 from src.data.progress import (
+    TIMEFRAME_SECONDS,
     ProgressTracker,
     RichProgressManager,
     _is_test_environment,
@@ -46,6 +47,20 @@ COINBASE_CANDLE_LIMIT = 300
 
 class CoinbaseDataClient:
     """Client for fetching OHLCV data from Coinbase."""
+
+    @staticmethod
+    def _calculate_expected_candles(start_ts: int, end_ts: int, timeframe: str) -> int:
+        """Calculate the expected number of candles for a time range.
+
+        Args:
+            start_ts: Start timestamp in milliseconds.
+            end_ts: End timestamp in milliseconds.
+            timeframe: Timeframe string (e.g., "1m", "5m", "1h").
+
+        Returns:
+            Expected number of candles as an integer.
+        """
+        return (end_ts - start_ts) // (1000 * TIMEFRAME_SECONDS[timeframe])
 
     def __init__(
         self,
@@ -190,6 +205,35 @@ class CoinbaseDataClient:
                 f"Unsupported timeframe: {timeframe}. Supported: {SUPPORTED_TIMEFRAMES}"
             )
 
+    def _flush_progress_update(
+        self,
+        pending_advance: int,
+        progress_task_id: Any,
+        shared_progress: Progress | None,
+        progress_tracker: ProgressTracker | None,
+        use_shared_progress: bool,
+        extra: int = 0,
+    ) -> int:
+        """Flush pending progress updates.
+
+        Args:
+            pending_advance: Number of batches to advance the progress.
+            progress_task_id: Task ID from shared Rich Progress.
+            shared_progress: Shared Rich Progress instance.
+            progress_tracker: Individual ProgressTracker instance.
+            use_shared_progress: Whether to use shared progress.
+            extra: Additional count to add to the advance (default 0).
+
+        Returns:
+            0 to reset pending_advance.
+        """
+        total_advance = pending_advance + extra
+        if use_shared_progress and shared_progress is not None and total_advance > 0:
+            shared_progress.update(progress_task_id, advance=total_advance)
+        elif progress_tracker is not None and total_advance > 0:
+            progress_tracker.update(n=total_advance)
+        return 0
+
     async def fetch(
         self,
         symbol: str,
@@ -234,19 +278,7 @@ class CoinbaseDataClient:
 
         # Calculate expected batches for progress tracking
         expected_batches = calculate_expected_batches(start_ts, end_ts, timeframe)
-        expected_candles = (end_ts - start_ts) // (
-            1000
-            * {
-                "1m": 60,
-                "5m": 300,
-                "15m": 900,
-                "30m": 1800,
-                "1h": 3600,
-                "2h": 7200,
-                "6h": 21600,
-                "1d": 86400,
-            }[timeframe]
-        )
+        expected_candles = self._calculate_expected_candles(start_ts, end_ts, timeframe)
 
         # Determine if we use shared progress or create our own
         use_shared_progress = (
@@ -297,11 +329,14 @@ class CoinbaseDataClient:
                 if not candles:
                     # Update progress even for empty result to show completion
                     # Include any pending advances from previous batches
-                    if use_shared_progress and shared_progress is not None:
-                        total_advance = pending_advance + 1
-                        shared_progress.update(progress_task_id, advance=total_advance)
-                    elif progress_tracker is not None:
-                        progress_tracker.update(n=1)
+                    pending_advance = self._flush_progress_update(
+                        pending_advance,
+                        progress_task_id,
+                        shared_progress,
+                        progress_tracker,
+                        use_shared_progress,
+                        extra=1,
+                    )
                     break
 
                 batch_num += 1
@@ -327,29 +362,25 @@ class CoinbaseDataClient:
                 last_candle_ts = candles[-1][0]
                 if end_ts and last_candle_ts > end_ts:
                     # Flush any pending progress before breaking
-                    if (
-                        use_shared_progress
-                        and shared_progress is not None
-                        and pending_advance > 0
-                    ):
-                        shared_progress.update(
-                            progress_task_id, advance=pending_advance
-                        )
-                        pending_advance = 0
+                    pending_advance = self._flush_progress_update(
+                        pending_advance,
+                        progress_task_id,
+                        shared_progress,
+                        progress_tracker,
+                        use_shared_progress,
+                    )
                     break
 
                 # Check if we've reached the latest (no more data)
                 if len(candles) < COINBASE_CANDLE_LIMIT:
                     # Flush any pending progress before breaking
-                    if (
-                        use_shared_progress
-                        and shared_progress is not None
-                        and pending_advance > 0
-                    ):
-                        shared_progress.update(
-                            progress_task_id, advance=pending_advance
-                        )
-                        pending_advance = 0
+                    pending_advance = self._flush_progress_update(
+                        pending_advance,
+                        progress_task_id,
+                        shared_progress,
+                        progress_tracker,
+                        use_shared_progress,
+                    )
                     break
 
                 # Move to next batch using the timestamp of the last candle + 1ms

@@ -795,3 +795,60 @@ def test_fetch_includes_candle_at_exact_end_timestamp():
     timestamps = result["timestamp"].to_list()
     assert timestamps[0] == datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
     assert timestamps[1] == datetime(2024, 1, 1, 0, 1, tzinfo=UTC)
+
+
+def test_refactored_fetch_preserves_behavior(tmp_path):
+    """Test that refactored code produces identical results to original.
+
+    This test validates that the fetch method returns expected data structure
+    and values after refactoring.
+    """
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+
+    # Create known test data
+    ts_1 = int(datetime(2024, 1, 1, 10, 0, tzinfo=UTC).timestamp() * 1000)
+    ts_2 = int(datetime(2024, 1, 1, 10, 5, tzinfo=UTC).timestamp() * 1000)
+    ts_3 = int(datetime(2024, 1, 1, 10, 10, tzinfo=UTC).timestamp() * 1000)
+
+    mock_candles = [
+        [ts_1, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],
+        [ts_2, 42050.0, 42150.0, 41950.0, 42100.0, 800.0],
+        [ts_3, 42100.0, 42200.0, 42000.0, 42150.0, 600.0],
+    ]
+
+    async def mock_fetch(*args, **kwargs):
+        return mock_candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch
+        mock_exchange.return_value = mock_exchange_instance
+
+        result = asyncio.run(
+            client.fetch("BTC/USD", "5m", "2024-01-01", "2024-01-01T12:00:00")
+        )
+
+    # Verify data structure is correct
+    assert isinstance(result, pl.DataFrame)
+    assert len(result) == 3
+    assert result.columns == ["timestamp", "open", "high", "low", "close", "volume"]
+
+    # Verify data values are correct
+    assert result["open"].to_list() == [42000.0, 42050.0, 42100.0]
+    assert result["high"].to_list() == [42100.0, 42150.0, 42200.0]
+    assert result["low"].to_list() == [41900.0, 41950.0, 42000.0]
+    assert result["close"].to_list() == [42050.0, 42100.0, 42150.0]
+    assert result["volume"].to_list() == [1000.0, 800.0, 600.0]
+
+    # Verify timestamps are correctly parsed
+    timestamps = result["timestamp"].to_list()
+    assert timestamps[0] == datetime(2024, 1, 1, 10, 0, tzinfo=UTC)
+    assert timestamps[1] == datetime(2024, 1, 1, 10, 5, tzinfo=UTC)
+    assert timestamps[2] == datetime(2024, 1, 1, 10, 10, tzinfo=UTC)
+
+    # Save and reload - verify data integrity is preserved
+    client.save(result, "BTC/USD", "5m")
+    loaded = client.load("BTC/USD", "5m")
+
+    assert len(loaded) == 3
+    assert loaded["close"].to_list() == result["close"].to_list()

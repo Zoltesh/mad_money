@@ -12,6 +12,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Logging
+*.log
+
 # Environment
 .env
 .env.local
