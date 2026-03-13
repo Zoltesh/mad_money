@@ -242,6 +242,85 @@ def test_parse_date():
         client._parse_date("invalid-date")
 
 
+def test_apply_end_of_day():
+    """Test _apply_end_of_day method with various edge cases."""
+    from datetime import datetime
+
+    # Test 1: Date with no time component and end_of_day=True - should convert to end of day
+    dt = datetime(2024, 1, 15, 0, 0, 0, 0)
+    result = CoinbaseDataClient._apply_end_of_day(dt, end_of_day=True)
+    assert result.hour == 23
+    assert result.minute == 59
+    assert result.second == 59
+    assert result.microsecond == 999999
+
+    # Test 2: Date with no time component and end_of_day=False - should remain unchanged
+    dt = datetime(2024, 1, 15, 0, 0, 0, 0)
+    result = CoinbaseDataClient._apply_end_of_day(dt, end_of_day=False)
+    assert result.hour == 0
+    assert result.minute == 0
+    assert result.second == 0
+    assert result.microsecond == 0
+
+    # Test 3: Date with time component and end_of_day=True - should remain unchanged
+    dt = datetime(2024, 1, 15, 10, 30, 0, 0)
+    result = CoinbaseDataClient._apply_end_of_day(dt, end_of_day=True)
+    assert result.hour == 10
+    assert result.minute == 30
+
+    # Test 4: Date with microseconds and no time component - should still convert
+    dt = datetime(2024, 1, 15, 0, 0, 0, 0)
+    result = CoinbaseDataClient._apply_end_of_day(dt, end_of_day=True)
+    assert result.microsecond == 999999
+
+    # Test 5: Date with non-zero microseconds and no time component - should NOT convert
+    # because microsecond != 0 means there's some time component
+    dt = datetime(2024, 1, 15, 0, 0, 0, 1)
+    result = CoinbaseDataClient._apply_end_of_day(dt, end_of_day=True)
+    assert result.microsecond == 1
+    assert result.hour == 0
+
+    # Test 6: Date with seconds set and no time component - should NOT convert
+    dt = datetime(2024, 1, 15, 0, 0, 1, 0)
+    result = CoinbaseDataClient._apply_end_of_day(dt, end_of_day=True)
+    assert result.second == 1
+    assert result.hour == 0
+
+    # Test 7: Naive datetime (no timezone) - should work correctly
+    dt = datetime(2024, 1, 15)
+    result = CoinbaseDataClient._apply_end_of_day(dt, end_of_day=True)
+    assert result.hour == 23
+    assert result.minute == 59
+    assert result.second == 59
+    assert result.microsecond == 999999
+
+
+def test_candles_to_dataframe():
+    """Test _candles_to_dataframe static method."""
+    # Test with empty list
+    result = CoinbaseDataClient._candles_to_dataframe([])
+    assert result.is_empty()
+    assert result.columns == ["timestamp", "open", "high", "low", "close", "volume"]
+
+    # Test with valid candles
+    candles = [
+        [1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],
+        [1704067260000, 42050.0, 42150.0, 42000.0, 42100.0, 800.0],
+    ]
+    result = CoinbaseDataClient._candles_to_dataframe(candles)
+
+    assert len(result) == 2
+    assert result.columns == ["timestamp", "open", "high", "low", "close", "volume"]
+
+    # Verify first row values
+    assert result["timestamp"][0] == datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    assert result["open"][0] == 42000.0
+    assert result["high"][0] == 42100.0
+    assert result["low"][0] == 41900.0
+    assert result["close"][0] == 42050.0
+    assert result["volume"][0] == 1000.0
+
+
 def test_fetch_returns_dataframe():
     """Test that fetch method returns a Polars DataFrame."""
     client = CoinbaseDataClient()

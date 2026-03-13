@@ -22,7 +22,7 @@ async def main():
                 "1d",
             ],  # Multiple timeframes
             start_date="2025-01-01",
-            end_date="2025-01-02",
+            end_date="2025-01-31",
         )
 
         for symbol, timeframes in results.items():

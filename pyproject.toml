@@ -21,6 +21,9 @@ dependencies = [
     "ipywidgets>=8.1.8",
     "rich>=14.3.3",
     "click>=8.1.0",
+    "matplotlib>=3.10.8",
+    "seaborn>=0.13.2",
+    "altair>=6.0.0",
 ]
 
 [tool.uv]

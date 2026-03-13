@@ -139,6 +139,27 @@ class CoinbaseDataClient:
         return self._semaphore
 
     @staticmethod
+    def _apply_end_of_day(dt: datetime, end_of_day: bool) -> datetime:
+        """Apply end-of-day conversion if datetime has no time component.
+
+        Args:
+            dt: The datetime to potentially modify.
+            end_of_day: If True and datetime has no time component, set to 23:59:59.999.
+
+        Returns:
+            Modified datetime if conditions met, otherwise unchanged.
+        """
+        if (
+            end_of_day
+            and dt.hour == 0
+            and dt.minute == 0
+            and dt.second == 0
+            and dt.microsecond == 0
+        ):
+            return dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        return dt
+
+    @staticmethod
     def _parse_date(date_str: str, end_of_day: bool = False) -> datetime:
         """Parse date string to datetime.
 
@@ -153,16 +174,7 @@ class CoinbaseDataClient:
         try:
             dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
             dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
-            # If no time component and end_of_day=True, set to end of day
-            if (
-                end_of_day
-                and dt.hour == 0
-                and dt.minute == 0
-                and dt.second == 0
-                and dt.microsecond == 0
-            ):
-                dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
-            return dt
+            return CoinbaseDataClient._apply_end_of_day(dt, end_of_day)
         except ValueError:
             pass
 
@@ -176,20 +188,40 @@ class CoinbaseDataClient:
         for fmt in formats:
             try:
                 dt = datetime.strptime(date_str, fmt)
-                # If no time component and end_of_day=True, set to end of day
-                if (
-                    end_of_day
-                    and dt.hour == 0
-                    and dt.minute == 0
-                    and dt.second == 0
-                    and dt.microsecond == 0
-                ):
-                    dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+                dt = CoinbaseDataClient._apply_end_of_day(dt, end_of_day)
                 return dt.replace(tzinfo=UTC)
             except ValueError:
                 continue
 
         raise ValueError(f"Unable to parse date: {date_str}")
+
+    @staticmethod
+    def _candles_to_dataframe(candles: list[list[float]]) -> pl.DataFrame:
+        """Convert ccxt candle list to Polars DataFrame.
+
+        Args:
+            candles: List of ccxt candles, where each candle is a list of
+                [timestamp_ms, open, high, low, close, volume].
+
+        Returns:
+            Polars DataFrame with OHLCV columns matching OHLCV_SCHEMA.
+        """
+        if not candles:
+            return pl.DataFrame(schema=OHLCV_SCHEMA)
+
+        return pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime.fromtimestamp(c[0] / 1000, tz=UTC) for c in candles
+                ],
+                "open": [c[1] for c in candles],
+                "high": [c[2] for c in candles],
+                "low": [c[3] for c in candles],
+                "close": [c[4] for c in candles],
+                "volume": [c[5] for c in candles],
+            },
+            schema=OHLCV_SCHEMA,
+        )
 
     def _validate_timeframe(self, timeframe: str) -> None:
         """Validate that the timeframe is supported.
@@ -205,7 +237,47 @@ class CoinbaseDataClient:
                 f"Unsupported timeframe: {timeframe}. Supported: {SUPPORTED_TIMEFRAMES}"
             )
 
-    def _flush_progress_update(
+    def _update_progress(
+        self,
+        pending_advance: int,
+        progress_task_id: Any,
+        shared_progress: Progress | None,
+        progress_tracker: ProgressTracker | None,
+        use_shared_progress: bool,
+        candles_so_far: int,
+        expected_candles: int,
+    ) -> int:
+        """Update progress after a batch is processed.
+
+        Args:
+            pending_advance: Current pending advance count.
+            progress_task_id: Task ID from shared Rich Progress.
+            shared_progress: Shared Rich Progress instance.
+            progress_tracker: Individual ProgressTracker instance.
+            use_shared_progress: Whether to use shared progress.
+            candles_so_far: Number of candles fetched so far.
+            expected_candles: Expected total candles.
+
+        Returns:
+            Updated pending_advance count (0 if flushed, else same as input).
+        """
+        update_interval = 10
+
+        if use_shared_progress and shared_progress is not None:
+            # Batch updates to reduce contention
+            pending_advance += 1
+            if pending_advance >= update_interval:
+                shared_progress.update(progress_task_id, advance=pending_advance)
+                return 0
+        elif progress_tracker is not None:
+            progress_tracker.update(
+                n=1,
+                candles_so_far=candles_so_far,
+                total_candles=expected_candles,
+            )
+        return pending_advance
+
+    def _flush_progress(
         self,
         pending_advance: int,
         progress_task_id: Any,
@@ -213,7 +285,7 @@ class CoinbaseDataClient:
         progress_tracker: ProgressTracker | None,
         use_shared_progress: bool,
         extra: int = 0,
-    ) -> int:
+    ) -> None:
         """Flush pending progress updates.
 
         Args:
@@ -223,16 +295,50 @@ class CoinbaseDataClient:
             progress_tracker: Individual ProgressTracker instance.
             use_shared_progress: Whether to use shared progress.
             extra: Additional count to add to the advance (default 0).
-
-        Returns:
-            0 to reset pending_advance.
         """
         total_advance = pending_advance + extra
         if use_shared_progress and shared_progress is not None and total_advance > 0:
             shared_progress.update(progress_task_id, advance=total_advance)
         elif progress_tracker is not None and total_advance > 0:
             progress_tracker.update(n=total_advance)
-        return 0
+
+    async def _fetch_batch(
+        self,
+        exchange: ccxt.async_support.coinbaseadvanced,
+        semaphore: asyncio.Semaphore,
+        symbol: str,
+        timeframe: str,
+        since: int,
+    ) -> list[list[float]]:
+        """Fetch a single batch of OHLCV data with rate limit handling.
+
+        Args:
+            exchange: The ccxt exchange instance.
+            semaphore: Concurrency semaphore.
+            symbol: Trading pair symbol.
+            timeframe: Timeframe for candles.
+            since: Start timestamp in milliseconds.
+
+        Returns:
+            List of candles, or empty list if no data.
+        """
+        async with semaphore:
+            try:
+                return await exchange.fetch_ohlcv(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    since=since,
+                    limit=COINBASE_CANDLE_LIMIT,
+                )
+            except ccxt.RateLimitExceeded:
+                await asyncio.sleep(self.rate_limit_backoff)
+                # Retry after rate limit
+                return await exchange.fetch_ohlcv(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    since=since,
+                    limit=COINBASE_CANDLE_LIMIT,
+                )
 
     async def fetch(
         self,
@@ -305,31 +411,18 @@ class CoinbaseDataClient:
 
         all_candles: list[list[float]] = []
         since = start_ts
-        batch_num = 0
         pending_advance = 0  # For batching progress updates (TASK-008)
-        update_interval = 10  # Update progress every N batches
 
         try:
-            while True:
-                async with semaphore:
-                    try:
-                        candles = await exchange.fetch_ohlcv(
-                            symbol=symbol,
-                            timeframe=timeframe,
-                            since=since,
-                            limit=COINBASE_CANDLE_LIMIT,
-                        )
-                    except ccxt.RateLimitExceeded:
-                        await asyncio.sleep(self.rate_limit_backoff)
-                        continue
-                    except Exception:
-                        # Re-raise other exceptions but handle gracefully
-                        raise
+            while since is not None:
+                # Fetch next batch with semaphore and rate limit handling
+                candles = await self._fetch_batch(
+                    exchange, semaphore, symbol, timeframe, int(since)
+                )
 
+                # Handle empty result - exit cleanly
                 if not candles:
-                    # Update progress even for empty result to show completion
-                    # Include any pending advances from previous batches
-                    pending_advance = self._flush_progress_update(
+                    self._flush_progress(
                         pending_advance,
                         progress_task_id,
                         shared_progress,
@@ -339,52 +432,45 @@ class CoinbaseDataClient:
                     )
                     break
 
-                batch_num += 1
+                # Process the batch
                 all_candles.extend(candles)
-
-                # Update progress - either shared or individual
-                if use_shared_progress and shared_progress is not None:
-                    # Batch updates to reduce contention (TASK-008)
-                    pending_advance += 1
-                    if pending_advance >= update_interval:
-                        shared_progress.update(
-                            progress_task_id, advance=pending_advance
-                        )
-                        pending_advance = 0
-                elif progress_tracker is not None:
-                    progress_tracker.update(
-                        n=1,
-                        candles_so_far=len(all_candles),
-                        total_candles=expected_candles,
-                    )
-
-                # Check if we've reached the end date or latest
                 last_candle_ts = candles[-1][0]
+
+                # Update progress tracking
+                pending_advance = self._update_progress(
+                    pending_advance,
+                    progress_task_id,
+                    shared_progress,
+                    progress_tracker,
+                    use_shared_progress,
+                    len(all_candles),
+                    expected_candles,
+                )
+
+                # Check exit conditions and set next batch timestamp
+                # Check if we've reached the end date
                 if end_ts and last_candle_ts > end_ts:
-                    # Flush any pending progress before breaking
-                    pending_advance = self._flush_progress_update(
+                    self._flush_progress(
                         pending_advance,
                         progress_task_id,
                         shared_progress,
                         progress_tracker,
                         use_shared_progress,
                     )
-                    break
-
+                    since = None
                 # Check if we've reached the latest (no more data)
-                if len(candles) < COINBASE_CANDLE_LIMIT:
-                    # Flush any pending progress before breaking
-                    pending_advance = self._flush_progress_update(
+                elif len(candles) < COINBASE_CANDLE_LIMIT:
+                    self._flush_progress(
                         pending_advance,
                         progress_task_id,
                         shared_progress,
                         progress_tracker,
                         use_shared_progress,
                     )
-                    break
-
-                # Move to next batch using the timestamp of the last candle + 1ms
-                since = last_candle_ts + 1
+                    since = None
+                else:
+                    # Continue to next batch using the timestamp of the last candle + 1ms
+                    since = last_candle_ts + 1
         finally:
             # Always close progress tracker (only if we created our own)
             if progress_tracker is not None:
@@ -407,21 +493,7 @@ class CoinbaseDataClient:
             all_candles = [c for c in all_candles if c[0] <= end_ts_filter]
 
         # Convert to Polars DataFrame
-        df = pl.DataFrame(
-            {
-                "timestamp": [
-                    datetime.fromtimestamp(c[0] / 1000, tz=UTC) for c in all_candles
-                ],
-                "open": [c[1] for c in all_candles],
-                "high": [c[2] for c in all_candles],
-                "low": [c[3] for c in all_candles],
-                "close": [c[4] for c in all_candles],
-                "volume": [c[5] for c in all_candles],
-            },
-            schema=OHLCV_SCHEMA,
-        )
-
-        return df
+        return self._candles_to_dataframe(all_candles)
 
     def save(
         self,
@@ -539,19 +611,7 @@ class CoinbaseDataClient:
             return pl.DataFrame(schema=OHLCV_SCHEMA)
 
         # Convert to Polars DataFrame
-        df = pl.DataFrame(
-            {
-                "timestamp": [
-                    datetime.fromtimestamp(c[0] / 1000, tz=UTC) for c in candles
-                ],
-                "open": [c[1] for c in candles],
-                "high": [c[2] for c in candles],
-                "low": [c[3] for c in candles],
-                "close": [c[4] for c in candles],
-                "volume": [c[5] for c in candles],
-            },
-            schema=OHLCV_SCHEMA,
-        )
+        df = self._candles_to_dataframe(candles)
 
         # Filter out excluded timestamps if provided
         if exclude_timestamps:
