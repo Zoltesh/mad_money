@@ -2,11 +2,20 @@
 
 import asyncio
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 
 import ccxt
 import ccxt.async_support
 import polars as pl
+
+
+class Verbosity(Enum):
+    """Verbosity levels for output control."""
+
+    DISABLED = "disabled"
+    PROGRESS = "progress"
+    VERBOSE = "verbose"
 
 # Schema for OHLCV data with required columns
 OHLCV_SCHEMA = {
@@ -35,6 +44,7 @@ class CoinbaseDataClient:
         rate_limit_backoff: float = 1.0,
         api_key: str | None = None,
         private_key: str | None = None,
+        verbosity: Verbosity = Verbosity.DISABLED,
     ) -> None:
         """Initialize the Coinbase data client.
 
@@ -44,12 +54,14 @@ class CoinbaseDataClient:
             rate_limit_backoff: Backoff time in seconds for rate limiting.
             api_key: Optional Coinbase API key for authenticated requests.
             private_key: Optional Coinbase private key (PEM format) for authenticated requests.
+            verbosity: Verbosity level for output control.
         """
         self.data_dir = data_dir
         self.max_concurrency = max_concurrency
         self.rate_limit_backoff = rate_limit_backoff
         self._api_key = api_key
         self._private_key = private_key
+        self.verbosity = verbosity
         self._exchange: ccxt.async_support.coinbaseadvanced | None = None
         self._semaphore: asyncio.Semaphore | None = None
 
@@ -163,6 +175,7 @@ class CoinbaseDataClient:
         timeframe: str,
         start_date: str,
         end_date: str | None = None,
+        verbosity: Verbosity | None = None,
     ) -> pl.DataFrame:
         """Fetch historical OHLCV data from Coinbase.
 
@@ -171,6 +184,7 @@ class CoinbaseDataClient:
             timeframe: Timeframe for candles (e.g., "1m", "5m", "1h").
             start_date: Start date for data retrieval.
             end_date: End date for data retrieval. Defaults to latest.
+            verbosity: Override verbosity level for this call.
 
         Returns:
             Polars DataFrame with OHLCV columns.
@@ -178,6 +192,8 @@ class CoinbaseDataClient:
         Raises:
             ValueError: If timeframe is not supported.
         """
+        # Use instance verbosity if not overridden
+        effective_verbosity = verbosity if verbosity is not None else self.verbosity
         self._validate_timeframe(timeframe)
 
         exchange = self._get_exchange()
@@ -541,6 +557,7 @@ class CoinbaseDataClient:
         timeframes: list[str],
         start_date: str,
         end_date: str | None = None,
+        verbosity: Verbosity | None = None,
     ) -> dict[str, dict[str, pl.DataFrame]]:
         """Fetch OHLCV data for multiple symbols and timeframes concurrently.
 
@@ -549,16 +566,19 @@ class CoinbaseDataClient:
             timeframes: List of timeframes (e.g., ["1m", "1h"]).
             start_date: Start date for data retrieval.
             end_date: End date for data retrieval. Defaults to latest.
+            verbosity: Override verbosity level for this call.
 
         Returns:
             Nested dict: {symbol: {timeframe: DataFrame}}
         """
+        # Use instance verbosity if not overridden
+        effective_verbosity = verbosity if verbosity is not None else self.verbosity
 
         # Build list of all fetch tasks
         async def fetch_one(
             symbol: str, timeframe: str
         ) -> tuple[str, str, pl.DataFrame]:
-            df = await self.fetch(symbol, timeframe, start_date, end_date)
+            df = await self.fetch(symbol, timeframe, start_date, end_date, effective_verbosity)
             return (symbol, timeframe, df)
 
         # Create all tasks
