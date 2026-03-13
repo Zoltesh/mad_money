@@ -93,3 +93,4 @@ Tests use pytest. Some tests use statsmodels for validation (optional - uses `py
 
 - Python 3.14+ required (specified in pyproject.toml)
 - Uses uv for dependency management
+- Progress bars work in both terminal and JupyterLab (uses tqdm for terminal, tqdm.notebook for Jupyter)

@@ -4,10 +4,19 @@ import asyncio
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import ccxt
 import ccxt.async_support
 import polars as pl
+from rich.progress import Progress
+
+from src.data.progress import (
+    ProgressTracker,
+    RichProgressManager,
+    _is_test_environment,
+    calculate_expected_batches,
+)
 
 
 class Verbosity(Enum):
@@ -16,6 +25,7 @@ class Verbosity(Enum):
     DISABLED = "disabled"
     PROGRESS = "progress"
     VERBOSE = "verbose"
+
 
 # Schema for OHLCV data with required columns
 OHLCV_SCHEMA = {
@@ -44,7 +54,7 @@ class CoinbaseDataClient:
         rate_limit_backoff: float = 1.0,
         api_key: str | None = None,
         private_key: str | None = None,
-        verbosity: Verbosity = Verbosity.DISABLED,
+        verbosity: Verbosity | None = None,
     ) -> None:
         """Initialize the Coinbase data client.
 
@@ -54,14 +64,25 @@ class CoinbaseDataClient:
             rate_limit_backoff: Backoff time in seconds for rate limiting.
             api_key: Optional Coinbase API key for authenticated requests.
             private_key: Optional Coinbase private key (PEM format) for authenticated requests.
-            verbosity: Verbosity level for output control.
+            verbosity: Verbosity level for output control. If None, auto-detects test environment.
         """
         self.data_dir = data_dir
         self.max_concurrency = max_concurrency
         self.rate_limit_backoff = rate_limit_backoff
         self._api_key = api_key
         self._private_key = private_key
-        self.verbosity = verbosity
+
+        # Auto-detect verbosity: disable in test environment if not explicitly set
+        if verbosity is not None:
+            # Explicitly provided - always use it
+            self.verbosity = verbosity
+        elif _is_test_environment():
+            # Not provided and in test environment - disable by default
+            self.verbosity = Verbosity.DISABLED
+        else:
+            # Not provided and not in test environment - default to progress
+            self.verbosity = Verbosity.PROGRESS
+
         self._exchange: ccxt.async_support.coinbaseadvanced | None = None
         self._semaphore: asyncio.Semaphore | None = None
 
@@ -176,6 +197,8 @@ class CoinbaseDataClient:
         start_date: str,
         end_date: str | None = None,
         verbosity: Verbosity | None = None,
+        progress_task_id: Any = None,
+        shared_progress: Progress | None = None,
     ) -> pl.DataFrame:
         """Fetch historical OHLCV data from Coinbase.
 
@@ -185,6 +208,8 @@ class CoinbaseDataClient:
             start_date: Start date for data retrieval.
             end_date: End date for data retrieval. Defaults to latest.
             verbosity: Override verbosity level for this call.
+            progress_task_id: Task ID from shared Rich Progress (for fetch_multiple).
+            shared_progress: Shared Rich Progress instance (for fetch_multiple).
 
         Returns:
             Polars DataFrame with OHLCV columns.
@@ -200,52 +225,155 @@ class CoinbaseDataClient:
         semaphore = self._get_semaphore()
 
         start_ts = int(self._parse_date(start_date).timestamp() * 1000)
-        end_ts = None
+        end_ts: int | None = None
+        current_ts = datetime.now(UTC).timestamp() * 1000
         if end_date:
             end_ts = int(self._parse_date(end_date, end_of_day=True).timestamp() * 1000)
+        else:
+            end_ts = int(current_ts)
+
+        # Calculate expected batches for progress tracking
+        expected_batches = calculate_expected_batches(start_ts, end_ts, timeframe)
+        expected_candles = (end_ts - start_ts) // (
+            1000
+            * {
+                "1m": 60,
+                "5m": 300,
+                "15m": 900,
+                "30m": 1800,
+                "1h": 3600,
+                "2h": 7200,
+                "6h": 21600,
+                "1d": 86400,
+            }[timeframe]
+        )
+
+        # Determine if we use shared progress or create our own
+        use_shared_progress = (
+            shared_progress is not None and progress_task_id is not None
+        )
+
+        # Initialize progress tracker if verbosity is enabled and not using shared
+        progress_tracker: ProgressTracker | None = None
+        if effective_verbosity != Verbosity.DISABLED and not use_shared_progress:
+            progress_tracker = RichProgressManager(
+                total=expected_batches,
+                symbol=symbol,
+                timeframe=timeframe,
+                verbosity=effective_verbosity,
+            )
+            progress_tracker.start()
+
+            # Verbose mode: print start message
+            if effective_verbosity == Verbosity.VERBOSE:
+                end_display = end_date if end_date else "latest"
+                print(
+                    f"Starting fetch for {symbol} {timeframe} from {start_date} to {end_display}..."
+                )
 
         all_candles: list[list[float]] = []
         since = start_ts
+        batch_num = 0
+        pending_advance = 0  # For batching progress updates (TASK-008)
+        update_interval = 10  # Update progress every N batches
 
-        while True:
-            async with semaphore:
-                try:
-                    candles = await exchange.fetch_ohlcv(
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        since=since,
-                        limit=COINBASE_CANDLE_LIMIT,
+        try:
+            while True:
+                async with semaphore:
+                    try:
+                        candles = await exchange.fetch_ohlcv(
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            since=since,
+                            limit=COINBASE_CANDLE_LIMIT,
+                        )
+                    except ccxt.RateLimitExceeded:
+                        await asyncio.sleep(self.rate_limit_backoff)
+                        continue
+                    except Exception:
+                        # Re-raise other exceptions but handle gracefully
+                        raise
+
+                if not candles:
+                    # Update progress even for empty result to show completion
+                    # Include any pending advances from previous batches
+                    if use_shared_progress and shared_progress is not None:
+                        total_advance = pending_advance + 1
+                        shared_progress.update(progress_task_id, advance=total_advance)
+                    elif progress_tracker is not None:
+                        progress_tracker.update(n=1)
+                    break
+
+                batch_num += 1
+                all_candles.extend(candles)
+
+                # Update progress - either shared or individual
+                if use_shared_progress and shared_progress is not None:
+                    # Batch updates to reduce contention (TASK-008)
+                    pending_advance += 1
+                    if pending_advance >= update_interval:
+                        shared_progress.update(
+                            progress_task_id, advance=pending_advance
+                        )
+                        pending_advance = 0
+                elif progress_tracker is not None:
+                    progress_tracker.update(
+                        n=1,
+                        candles_so_far=len(all_candles),
+                        total_candles=expected_candles,
                     )
-                except ccxt.RateLimitExceeded:
-                    await asyncio.sleep(self.rate_limit_backoff)
-                    continue
-                except Exception:
-                    # Re-raise other exceptions but handle gracefully
-                    raise
 
-            if not candles:
-                break
+                # Check if we've reached the end date or latest
+                last_candle_ts = candles[-1][0]
+                if end_ts and last_candle_ts > end_ts:
+                    # Flush any pending progress before breaking
+                    if (
+                        use_shared_progress
+                        and shared_progress is not None
+                        and pending_advance > 0
+                    ):
+                        shared_progress.update(
+                            progress_task_id, advance=pending_advance
+                        )
+                        pending_advance = 0
+                    break
 
-            all_candles.extend(candles)
+                # Check if we've reached the latest (no more data)
+                if len(candles) < COINBASE_CANDLE_LIMIT:
+                    # Flush any pending progress before breaking
+                    if (
+                        use_shared_progress
+                        and shared_progress is not None
+                        and pending_advance > 0
+                    ):
+                        shared_progress.update(
+                            progress_task_id, advance=pending_advance
+                        )
+                        pending_advance = 0
+                    break
 
-            # Check if we've reached the end date or latest
-            last_candle_ts = candles[-1][0]
-            if end_ts and last_candle_ts >= end_ts:
-                break
+                # Move to next batch using the timestamp of the last candle + 1ms
+                since = last_candle_ts + 1
+        finally:
+            # Always close progress tracker (only if we created our own)
+            if progress_tracker is not None:
+                progress_tracker.close()
 
-            # Check if we've reached the latest (no more data)
-            if len(candles) < COINBASE_CANDLE_LIMIT:
-                break
-
-            # Move to next batch using the timestamp of the last candle + 1ms
-            since = last_candle_ts + 1
+                # Verbose mode: print completion message
+                if effective_verbosity == Verbosity.VERBOSE:
+                    print(
+                        f"Completed fetch for {symbol} {timeframe}: {len(all_candles)} candles fetched"
+                    )
 
         if not all_candles:
             return pl.DataFrame(schema=OHLCV_SCHEMA)
 
         # Filter to end_date if specified
-        if end_ts:
-            all_candles = [c for c in all_candles if c[0] <= end_ts]
+        if end_date:
+            end_ts_filter = int(
+                self._parse_date(end_date, end_of_day=True).timestamp() * 1000
+            )
+            all_candles = [c for c in all_candles if c[0] <= end_ts_filter]
 
         # Convert to Polars DataFrame
         df = pl.DataFrame(
@@ -574,27 +702,102 @@ class CoinbaseDataClient:
         # Use instance verbosity if not overridden
         effective_verbosity = verbosity if verbosity is not None else self.verbosity
 
-        # Build list of all fetch tasks
+        # Build list of all symbol/timeframe combinations
+        combinations = [(s, t) for s in symbols for t in timeframes]
+
+        # Verbose mode: print batch start message
+        if effective_verbosity == Verbosity.VERBOSE:
+            end_display = end_date if end_date else "latest"
+            print(
+                f"Starting batch fetch for {len(combinations)} symbol/timeframe combinations "
+                f"from {start_date} to {end_display}..."
+            )
+
+        # Create shared Rich Progress if verbosity is enabled
+        shared_progress: Progress | None = None
+        task_ids: dict[tuple[str, str], Any] = {}
+        if effective_verbosity != Verbosity.DISABLED:
+            from rich.progress import (
+                BarColumn,
+                SpinnerColumn,
+                TextColumn,
+                TimeRemainingColumn,
+            )
+
+            from src.data.progress import get_progress_color
+
+            # Create one progress for all tasks
+            shared_progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[bold]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TextColumn("({task.completed}/{task.total} batches)"),
+                TimeRemainingColumn(),
+            )
+            shared_progress.start()
+
+            # Add all tasks upfront with expected batches
+            # Calculate expected batches for each timeframe
+            start_ts = int(self._parse_date(start_date).timestamp() * 1000)
+            end_ts: int
+            if end_date:
+                end_ts = int(
+                    self._parse_date(end_date, end_of_day=True).timestamp() * 1000
+                )
+            else:
+                end_ts = int(datetime.now(UTC).timestamp() * 1000)
+
+            for symbol, timeframe in combinations:
+                color = get_progress_color(symbol, timeframe)
+                description = f"[{color}]{symbol} {timeframe}[/{color}]"
+                # Calculate expected batches for this specific timeframe
+                expected_batches = calculate_expected_batches(
+                    start_ts, end_ts, timeframe
+                )
+                task_id = shared_progress.add_task(description, total=expected_batches)
+                task_ids[(symbol, timeframe)] = task_id
+
+        # Build list of all fetch tasks with their task IDs
         async def fetch_one(
-            symbol: str, timeframe: str
+            symbol: str, timeframe: str, task_id: Any
         ) -> tuple[str, str, pl.DataFrame]:
-            df = await self.fetch(symbol, timeframe, start_date, end_date, effective_verbosity)
+            df = await self.fetch(
+                symbol,
+                timeframe,
+                start_date,
+                end_date,
+                effective_verbosity,
+                progress_task_id=task_id,
+                shared_progress=shared_progress,
+            )
             return (symbol, timeframe, df)
 
         # Create all tasks
         tasks = []
-        for symbol in symbols:
-            for timeframe in timeframes:
-                tasks.append(fetch_one(symbol, timeframe))
+        for symbol, timeframe in combinations:
+            task_id = task_ids.get((symbol, timeframe))
+            tasks.append(fetch_one(symbol, timeframe, task_id))
 
         # Run all concurrently
-        results = await asyncio.gather(*tasks)
+        try:
+            results = await asyncio.gather(*tasks)
+        finally:
+            # Stop shared progress regardless of success or failure
+            if shared_progress is not None:
+                shared_progress.stop()
 
         # Build nested dict structure
         result_dict: dict[str, dict[str, pl.DataFrame]] = {}
+        total_candles = 0
         for symbol, timeframe, df in results:
             if symbol not in result_dict:
                 result_dict[symbol] = {}
             result_dict[symbol][timeframe] = df
+            total_candles += len(df)
+
+        # Verbose mode: print batch completion message
+        if effective_verbosity == Verbosity.VERBOSE:
+            print(f"Completed batch fetch: {total_candles} total candles fetched")
 
         return result_dict

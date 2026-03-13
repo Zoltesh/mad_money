@@ -653,3 +653,145 @@ def test_full_workflow_integration(tmp_path):
     # Final verification: load again to confirm persistence
     final_loaded = client.load("BTC/USD", "5m", year=2025, month=1)
     assert len(final_loaded) == 4, "Updated data should be persisted"
+
+
+def test_fetch_multiple_progress_bar_stopped_on_exception():
+    """Test that progress bar is stopped when exception occurs in fetch_multiple."""
+    from src.data.ohlcv import Verbosity
+
+    client = CoinbaseDataClient()
+
+    # Track if progress bar was stopped
+    progress_stopped = []
+
+    # Create a mock Progress class that tracks stop calls
+    class MockProgress:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            progress_stopped.append(True)
+
+        def add_task(self, *args, **kwargs):
+            return 0
+
+        def update(self, *args, **kwargs):
+            pass
+
+    # Mock fetch that raises exception
+    async def mock_fetch_error(*args, **kwargs):
+        raise Exception("Simulated API error")
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch_error
+        mock_exchange.return_value = mock_exchange_instance
+
+        with patch("src.data.ohlcv.Progress", MockProgress):
+            try:
+                asyncio.run(
+                    client.fetch_multiple(
+                        symbols=["INVALID/SYM"],
+                        timeframes=["1m"],
+                        start_date="2024-01-01",
+                        verbosity=Verbosity.PROGRESS,
+                    )
+                )
+            except Exception:
+                pass  # Expected to fail
+
+    # Verify progress bar was stopped despite exception
+    assert len(progress_stopped) > 0, "Progress bar stop should be called"
+
+
+def test_fetch_multiple_progress_bar_stopped_on_success():
+    """Test that progress bar is stopped on normal completion of fetch_multiple."""
+    from src.data.ohlcv import Verbosity
+
+    client = CoinbaseDataClient()
+
+    # Track if progress bar was stopped
+    progress_stopped = []
+
+    class MockProgress:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            progress_stopped.append(True)
+
+        def add_task(self, *args, **kwargs):
+            return 0
+
+        def update(self, *args, **kwargs):
+            pass
+
+    # Mock successful fetch
+    mock_candles = [
+        [1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],
+    ]
+
+    async def mock_fetch(*args, **kwargs):
+        return mock_candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch
+        mock_exchange.return_value = mock_exchange_instance
+
+        with patch("src.data.ohlcv.Progress", MockProgress):
+            asyncio.run(
+                client.fetch_multiple(
+                    symbols=["BTC/USD"],
+                    timeframes=["1m"],
+                    start_date="2024-01-01",
+                    verbosity=Verbosity.PROGRESS,
+                )
+            )
+
+    # Verify progress bar was stopped on success
+    assert len(progress_stopped) > 0, "Progress bar stop should be called on success"
+
+
+def test_fetch_includes_candle_at_exact_end_timestamp():
+    """Test that candles at exact end timestamp are included in fetch results."""
+    client = CoinbaseDataClient()
+
+    # Create timestamps where one is exactly at the end boundary
+    ts_1 = int(datetime(2024, 1, 1, 0, 0, tzinfo=UTC).timestamp() * 1000)  # 00:00
+    ts_2 = int(datetime(2024, 1, 1, 0, 1, tzinfo=UTC).timestamp() * 1000)  # 00:01
+    ts_3 = int(datetime(2024, 1, 1, 0, 2, tzinfo=UTC).timestamp() * 1000)  # 00:02
+
+    mock_candles = [
+        [ts_1, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],
+        [ts_2, 42050.0, 42150.0, 42000.0, 42100.0, 800.0],
+        [ts_3, 42100.0, 42200.0, 42050.0, 42150.0, 600.0],
+    ]
+
+    async def mock_fetch(*args, **kwargs):
+        return mock_candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch
+        mock_exchange.return_value = mock_exchange_instance
+
+        # Fetch with end_date at exactly 00:01 - should include candle at 00:01
+        result = asyncio.run(
+            client.fetch("BTC/USD", "1m", "2024-01-01", "2024-01-01T00:01:00")
+        )
+
+    # With the fix (using > instead of >=), candle at exactly end_ts should be included
+    # So we should have 2 candles: 00:00 and 00:01
+    assert len(result) == 2, f"Expected 2 candles, got {len(result)}"
+
+    # Verify the timestamps
+    timestamps = result["timestamp"].to_list()
+    assert timestamps[0] == datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    assert timestamps[1] == datetime(2024, 1, 1, 0, 1, tzinfo=UTC)
