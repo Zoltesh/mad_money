@@ -44,6 +44,9 @@ SUPPORTED_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "2h", "6h", "1d"]
 # Coinbase API limit
 COINBASE_CANDLE_LIMIT = 300
 
+# Progress update interval: batch progress updates to reduce contention in concurrent operations
+PROGRESS_UPDATE_INTERVAL = 10
+
 
 class CoinbaseDataClient:
     """Client for fetching OHLCV data from Coinbase."""
@@ -261,12 +264,10 @@ class CoinbaseDataClient:
         Returns:
             Updated pending_advance count (0 if flushed, else same as input).
         """
-        update_interval = 10
-
         if use_shared_progress and shared_progress is not None:
             # Batch updates to reduce contention
             pending_advance += 1
-            if pending_advance >= update_interval:
+            if pending_advance >= PROGRESS_UPDATE_INTERVAL:
                 shared_progress.update(progress_task_id, advance=pending_advance)
                 return 0
         elif progress_tracker is not None:
@@ -495,6 +496,18 @@ class CoinbaseDataClient:
         # Convert to Polars DataFrame
         return self._candles_to_dataframe(all_candles)
 
+    @staticmethod
+    def _symbol_to_path(symbol: str) -> str:
+        """Convert symbol to path-friendly format.
+
+        Args:
+            symbol: Trading pair symbol (e.g., "BTC/USD", "BTC-USDC").
+
+        Returns:
+            Path-friendly string (e.g., "btc-usd").
+        """
+        return symbol.replace("/", "-").lower()
+
     def save(
         self,
         df: pl.DataFrame,
@@ -523,7 +536,7 @@ class CoinbaseDataClient:
             raise ValueError(f"DataFrame missing required columns: {missing}")
 
         # Normalize symbol to path-friendly format (e.g., BTC/USD -> btc-usd)
-        pair_path = symbol.replace("/", "-").lower()
+        pair_path = self._symbol_to_path(symbol)
 
         # Extract year and month for partitioning
         df_with_partition = df.with_columns(
@@ -717,7 +730,7 @@ class CoinbaseDataClient:
             raise ValueError(f"month must be between 1 and 12, got {month}")
 
         # Normalize symbol to path-friendly format
-        pair_path = symbol.replace("/", "-").lower()
+        pair_path = self._symbol_to_path(symbol)
 
         # Build base path
         base_path = Path(self.data_dir) / "coinbase" / "ohlcv" / pair_path / timeframe

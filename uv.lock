@@ -114,22 +114,6 @@ wheels = [
 ]
 
 [[package]]
-name = "altair"
-version = "6.0.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "jinja2" },
-    { name = "jsonschema" },
-    { name = "narwhals" },
-    { name = "packaging" },
-    { name = "typing-extensions", marker = "python_full_version < '3.15'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/f7/c0/184a89bd5feba14ff3c41cfaf1dd8a82c05f5ceedbc92145e17042eb08a4/altair-6.0.0.tar.gz", hash = "sha256:614bf5ecbe2337347b590afb111929aa9c16c9527c4887d96c9bc7f6640756b4", size = 763834, upload-time = "2025-11-12T08:59:11.519Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/db/33/ef2f2409450ef6daa61459d5de5c08128e7d3edb773fefd0a324d1310238/altair-6.0.0-py3-none-any.whl", hash = "sha256:09ae95b53d5fe5b16987dccc785a7af8588f2dca50de1e7a156efa8a461515f8", size = 795410, upload-time = "2025-11-12T08:59:09.804Z" },
-]
-
-[[package]]
 name = "annotated-types"
 version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1195,7 +1179,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
-    { name = "altair" },
     { name = "ccxt" },
     { name = "click" },
     { name = "ipywidgets" },
@@ -1219,7 +1202,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.13.3" },
-    { name = "altair", specifier = ">=6.0.0" },
     { name = "ccxt", specifier = ">=4.5.42" },
     { name = "click", specifier = ">=8.1.0" },
     { name = "ipywidgets", specifier = ">=8.1.8" },
@@ -1460,15 +1442,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/0c/f7/addf1087b860ac60e6f382240f64fb99f8bfb532bb06f7c542b83c29ca61/multidict-6.7.1-cp314-cp314t-win_amd64.whl", hash = "sha256:497bde6223c212ba11d462853cfa4f0ae6ef97465033e7dc9940cdb3ab5b48e5", size = 53542, upload-time = "2026-01-26T02:46:08.809Z" },
     { url = "https://files.pythonhosted.org/packages/4c/81/4629d0aa32302ef7b2ec65c75a728cc5ff4fa410c50096174c1632e70b3e/multidict-6.7.1-cp314-cp314t-win_arm64.whl", hash = "sha256:2bbd113e0d4af5db41d5ebfe9ccaff89de2120578164f86a5d17d5a576d1e5b2", size = 44719, upload-time = "2026-01-26T02:46:11.146Z" },
     { url = "https://files.pythonhosted.org/packages/81/08/7036c080d7117f28a4af526d794aab6a84463126db031b007717c1a6676e/multidict-6.7.1-py3-none-any.whl", hash = "sha256:55d97cc6dae627efa6a6e548885712d4864b81110ac76fa4e534c03819fa4a56", size = 12319, upload-time = "2026-01-26T02:46:44.004Z" },
-]
-
-[[package]]
-name = "narwhals"
-version = "2.18.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/47/b4/02a8add181b8d2cd5da3b667cd102ae536e8c9572ab1a130816d70a89edb/narwhals-2.18.0.tar.gz", hash = "sha256:1de5cee338bc17c338c6278df2c38c0dd4290499fcf70d75e0a51d5f22a6e960", size = 620222, upload-time = "2026-03-10T15:51:27.14Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/fe/75/0b4a10da17a44cf13567d08a9c7632a285297e46253263f1ae119129d10a/narwhals-2.18.0-py3-none-any.whl", hash = "sha256:68378155ee706ac9c5b25868ef62ecddd62947b6df7801a0a156bc0a615d2d0d", size = 444865, upload-time = "2026-03-10T15:51:24.085Z" },
 ]
 
 [[package]]

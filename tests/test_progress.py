@@ -196,8 +196,8 @@ class TestDisabledMode:
             verbosity=Verbosity.DISABLED,
         )
 
-        # Should not create a tqdm instance when disabled
-        assert tracker._pbar is None
+        # Should not create a Rich Progress instance when disabled
+        assert tracker._progress is None
         assert tracker._enabled is False
 
     def test_progress_tracker_update_no_op_when_disabled(self):
