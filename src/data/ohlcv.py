@@ -141,6 +141,17 @@ class CoinbaseDataClient:
             self._semaphore = asyncio.Semaphore(self.max_concurrency)
         return self._semaphore
 
+    def _resolve_verbosity(self, verbosity: Verbosity | None) -> Verbosity:
+        """Resolve effective verbosity level.
+
+        Args:
+            verbosity: Optional verbosity override. If None, uses instance default.
+
+        Returns:
+            Effective Verbosity level to use.
+        """
+        return verbosity if verbosity is not None else self.verbosity
+
     @staticmethod
     def _apply_end_of_day(dt: datetime, end_of_day: bool) -> datetime:
         """Apply end-of-day conversion if datetime has no time component.
@@ -323,23 +334,37 @@ class CoinbaseDataClient:
         Returns:
             List of candles, or empty list if no data.
         """
+        return await self._fetch_with_retry(
+            exchange,
+            semaphore,
+            symbol=symbol,
+            timeframe=timeframe,
+            since=since,
+            limit=COINBASE_CANDLE_LIMIT,
+        )
+
+    async def _fetch_with_retry(
+        self,
+        exchange: ccxt.async_support.coinbaseadvanced,
+        semaphore: asyncio.Semaphore,
+        **kwargs: Any,
+    ) -> Any:
+        """Fetch OHLCV data with rate-limit retry handling.
+
+        Args:
+            exchange: The ccxt exchange instance.
+            semaphore: Concurrency semaphore.
+            **kwargs: Arguments passed to exchange.fetch_ohlcv.
+
+        Returns:
+            List of candles from fetch_ohlcv.
+        """
         async with semaphore:
             try:
-                return await exchange.fetch_ohlcv(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    since=since,
-                    limit=COINBASE_CANDLE_LIMIT,
-                )
+                return await exchange.fetch_ohlcv(**kwargs)
             except ccxt.RateLimitExceeded:
                 await asyncio.sleep(self.rate_limit_backoff)
-                # Retry after rate limit
-                return await exchange.fetch_ohlcv(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    since=since,
-                    limit=COINBASE_CANDLE_LIMIT,
-                )
+                return await exchange.fetch_ohlcv(**kwargs)
 
     async def fetch(
         self,
@@ -369,7 +394,7 @@ class CoinbaseDataClient:
             ValueError: If timeframe is not supported.
         """
         # Use instance verbosity if not overridden
-        effective_verbosity = verbosity if verbosity is not None else self.verbosity
+        effective_verbosity = self._resolve_verbosity(verbosity)
         self._validate_timeframe(timeframe)
 
         exchange = self._get_exchange()
@@ -607,22 +632,13 @@ class CoinbaseDataClient:
         semaphore = self._get_semaphore()
 
         # Fetch latest candles without date range
-        async with semaphore:
-            try:
-                candles = await exchange.fetch_ohlcv(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    limit=limit,
-                )
-            except ccxt.RateLimitExceeded:
-                await asyncio.sleep(self.rate_limit_backoff)
-                candles = await exchange.fetch_ohlcv(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    limit=limit,
-                )
-            except Exception:
-                raise
+        candles = await self._fetch_with_retry(
+            exchange,
+            semaphore,
+            symbol=symbol,
+            timeframe=timeframe,
+            limit=limit,
+        )
 
         if not candles:
             return pl.DataFrame(schema=OHLCV_SCHEMA)
@@ -808,7 +824,7 @@ class CoinbaseDataClient:
             Nested dict: {symbol: {timeframe: DataFrame}}
         """
         # Use instance verbosity if not overridden
-        effective_verbosity = verbosity if verbosity is not None else self.verbosity
+        effective_verbosity = self._resolve_verbosity(verbosity)
 
         # Build list of all symbol/timeframe combinations
         combinations = [(s, t) for s in symbols for t in timeframes]
