@@ -171,8 +171,8 @@ def _compute_vif_streaming(df: pl.DataFrame, chunk_size: int) -> pl.DataFrame:
         # Add correlation contribution
         r_accum += chunk.T @ chunk
 
-    # Final correlation matrix
-    r = r_accum / n_rows
+    # Final correlation matrix (use n-1 for unbiased estimator, same as matrix method)
+    r = r_accum / (n_rows - 1)
 
     # Compute VIF from correlation matrix (same as matrix method)
     try:
@@ -180,10 +180,11 @@ def _compute_vif_streaming(df: pl.DataFrame, chunk_size: int) -> pl.DataFrame:
     except np.linalg.LinAlgError:
         r_inv = np.linalg.pinv(r)
 
-    r_squared = 1 - 1 / np.diag(r_inv)
-    r_squared = np.clip(r_squared, -1, 1)
+    # For standardized variables: VIF_i = (R_inv)_{ii}
+    vif = np.diag(r_inv)
 
-    vif = np.where(r_squared >= 1, np.inf, 1 / (1 - r_squared))
+    # Handle any numerical issues - VIF should be >= 1
+    vif = np.where(vif < 1, 1.0, vif)
 
     return pl.DataFrame(
         {
