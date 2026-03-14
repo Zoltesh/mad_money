@@ -931,3 +931,421 @@ def test_refactored_fetch_preserves_behavior(tmp_path):
 
     assert len(loaded) == 3
     assert loaded["close"].to_list() == result["close"].to_list()
+
+
+def test_fetch_rate_limit_retry():
+    """Test that rate limit triggers retry and succeeds on second attempt."""
+    import ccxt
+
+    client = CoinbaseDataClient()
+
+    mock_candles = [
+        [1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],
+    ]
+
+    call_count = 0
+
+    async def mock_fetch_with_rate_limit(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First call raises rate limit
+            raise ccxt.RateLimitExceeded({"message": "Rate limit exceeded"})
+        # Second call succeeds
+        return mock_candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch_with_rate_limit
+        mock_exchange.return_value = mock_exchange_instance
+
+        result = asyncio.run(client.fetch("BTC/USD", "1m", "2024-01-01"))
+
+    # Verify retry happened
+    assert call_count == 2, "Should have made 2 calls (initial + retry)"
+    # Verify data was returned on retry
+    assert len(result) == 1
+    assert result["close"][0] == 42050.0
+
+
+def test_fetch_network_error():
+    """Test that network errors propagate correctly."""
+    import ccxt
+
+    client = CoinbaseDataClient()
+
+    async def mock_fetch_network_error(*args, **kwargs):
+        raise ccxt.NetworkError({"message": "Connection failed"})
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch_network_error
+        mock_exchange.return_value = mock_exchange_instance
+
+        with pytest.raises(ccxt.NetworkError):
+            asyncio.run(client.fetch("BTC/USD", "1m", "2024-01-01"))
+
+
+def test_fetch_invalid_symbol():
+    """Test that invalid symbol returns appropriate error."""
+    import ccxt
+
+    client = CoinbaseDataClient()
+
+    async def mock_fetch_invalid_symbol(*args, **kwargs):
+        raise ccxt.BadSymbol({"message": "Symbol not found"})
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch_invalid_symbol
+        mock_exchange.return_value = mock_exchange_instance
+
+        with pytest.raises(ccxt.BadSymbol):
+            asyncio.run(client.fetch("INVALID/SYMBOL", "1m", "2024-01-01"))
+
+
+def test_fetch_rate_limit_exhausted():
+    """Test behavior when rate limits persist (both attempts fail)."""
+    import ccxt
+
+    client = CoinbaseDataClient()
+
+    async def mock_fetch_always_rate_limited(*args, **kwargs):
+        raise ccxt.RateLimitExceeded({"message": "Rate limit exceeded"})
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch_always_rate_limited
+        mock_exchange.return_value = mock_exchange_instance
+
+        with pytest.raises(ccxt.RateLimitExceeded):
+            asyncio.run(client.fetch("BTC/USD", "1m", "2024-01-01"))
+
+
+def test_fetch_latest_rate_limit_retry():
+    """Test that fetch_latest retries on rate limit and succeeds."""
+    import ccxt
+
+    client = CoinbaseDataClient()
+
+    mock_candles = [
+        [1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],
+    ]
+
+    call_count = 0
+
+    async def mock_fetch_with_rate_limit(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ccxt.RateLimitExceeded({"message": "Rate limit exceeded"})
+        return mock_candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch_with_rate_limit
+        mock_exchange.return_value = mock_exchange_instance
+
+        result = asyncio.run(client.fetch_latest("BTC/USD", "1m"))
+
+    assert call_count == 2
+    assert len(result) == 1
+    assert result["close"][0] == 42050.0
+
+
+def test_fetch_latest_network_error():
+    """Test that fetch_latest propagates network errors."""
+    import ccxt
+
+    client = CoinbaseDataClient()
+
+    async def mock_fetch_network_error(*args, **kwargs):
+        raise ccxt.NetworkError({"message": "Connection failed"})
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch_network_error
+        mock_exchange.return_value = mock_exchange_instance
+
+        with pytest.raises(ccxt.NetworkError):
+            asyncio.run(client.fetch_latest("BTC/USD", "1m"))
+
+
+def test_fetch_latest_invalid_symbol():
+    """Test that fetch_latest raises BadSymbol for invalid symbols."""
+    import ccxt
+
+    client = CoinbaseDataClient()
+
+    async def mock_fetch_invalid_symbol(*args, **kwargs):
+        raise ccxt.BadSymbol({"message": "Symbol not found"})
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch_invalid_symbol
+        mock_exchange.return_value = mock_exchange_instance
+
+        with pytest.raises(ccxt.BadSymbol):
+            asyncio.run(client.fetch_latest("INVALID/SYMBOL", "1m"))
+
+
+def test_fetch_latest_rate_limit_exhausted():
+    """Test fetch_latest raises exception when rate limits persist."""
+    import ccxt
+
+    client = CoinbaseDataClient()
+
+    async def mock_fetch_always_rate_limited(*args, **kwargs):
+        raise ccxt.RateLimitExceeded({"message": "Rate limit exceeded"})
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch_always_rate_limited
+        mock_exchange.return_value = mock_exchange_instance
+
+        with pytest.raises(ccxt.RateLimitExceeded):
+            asyncio.run(client.fetch_latest("BTC/USD", "1m"))
+
+
+def test_candles_high_low_integrity():
+    """Test that high >= open, high >= close, low <= open, low <= close."""
+    # Create sample OHLCV data that satisfies integrity constraints
+    candles = [
+        [1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],
+        [1704067260000, 42050.0, 42150.0, 41950.0, 42100.0, 800.0],
+        [1704067320000, 42100.0, 42200.0, 42000.0, 42150.0, 600.0],
+    ]
+    df = CoinbaseDataClient._candles_to_dataframe(candles)
+
+    # Verify high is the maximum of OHLC for each row
+    for i in range(len(df)):
+        row = df.row(i, named=True)
+        assert row["high"] >= row["open"], f"high must be >= open at row {i}"
+        assert row["high"] >= row["close"], f"high must be >= close at row {i}"
+        assert row["high"] >= row["low"], f"high must be >= low at row {i}"
+
+    # Verify low is the minimum of OHLC for each row
+    for i in range(len(df)):
+        row = df.row(i, named=True)
+        assert row["low"] <= row["open"], f"low must be <= open at row {i}"
+        assert row["low"] <= row["close"], f"low must be <= close at row {i}"
+        assert row["low"] <= row["high"], f"low must be <= high at row {i}"
+
+
+def test_candles_positive_prices():
+    """Test that all prices are positive."""
+    candles = [
+        [1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],
+        [1704067260000, 42050.0, 42150.0, 41950.0, 42100.0, 800.0],
+    ]
+    df = CoinbaseDataClient._candles_to_dataframe(candles)
+
+    # Check all price columns are positive
+    assert (df["open"] > 0).all(), "open prices must be positive"
+    assert (df["high"] > 0).all(), "high prices must be positive"
+    assert (df["low"] > 0).all(), "low prices must be positive"
+    assert (df["close"] > 0).all(), "close prices must be positive"
+
+
+def test_save_empty_dataframe(tmp_path):
+    """Test that saving empty DataFrame is a no-op."""
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+
+    # Create an empty DataFrame with correct schema
+    empty_df = pl.DataFrame(
+        {
+            "timestamp": pl.Series([], dtype=pl.Datetime),
+            "open": pl.Series([], dtype=pl.Float64),
+            "high": pl.Series([], dtype=pl.Float64),
+            "low": pl.Series([], dtype=pl.Float64),
+            "close": pl.Series([], dtype=pl.Float64),
+            "volume": pl.Series([], dtype=pl.Float64),
+        }
+    )
+
+    # Save empty DataFrame - should be a no-op (no exception, no file created)
+    client.save(empty_df, "BTC/USD", "1h")
+
+    # Verify no parquet file was created
+    parquet_path = tmp_path / "coinbase" / "ohlcv" / "btc-usd" / "1h"
+    assert not parquet_path.exists(), "No file should be created for empty DataFrame"
+
+
+def test_candles_non_negative_volume():
+    """Test that volume is non-negative."""
+    candles = [
+        [1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],
+        [1704067260000, 42050.0, 42150.0, 41950.0, 42100.0, 0.0],
+        [1704067320000, 42100.0, 42200.0, 42000.0, 42150.0, 600.0],
+    ]
+    df = CoinbaseDataClient._candles_to_dataframe(candles)
+
+    # Check volume is non-negative
+    assert (df["volume"] >= 0).all(), "volume must be non-negative"
+
+
+def test_fetch_invalid_date_order():
+    """Test behavior when end_date is before start_date."""
+    client = CoinbaseDataClient()
+
+    # Mock candles with timestamps
+    mock_candles = [
+        [1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0],  # 2024-01-01 00:00
+        [1704067260000, 42050.0, 42150.0, 42000.0, 42100.0, 800.0],  # 2024-01-01 00:01
+    ]
+
+    async def mock_fetch(*args, **kwargs):
+        return mock_candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch
+        mock_exchange.return_value = mock_exchange_instance
+
+        # Fetch with end_date before start_date - should return empty
+        result = asyncio.run(client.fetch("BTC/USD", "1m", "2024-01-02", "2024-01-01"))
+
+    # Should return empty DataFrame when end_date < start_date
+    assert result.is_empty(), "Should return empty when end_date before start_date"
+
+
+def test_save_duplicate_timestamps(tmp_path):
+    """Test that duplicate timestamps are deduplicated on save."""
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+
+    # Create data with duplicate timestamps
+    df_with_duplicates = pl.DataFrame(
+        {
+            "timestamp": [
+                datetime(2025, 1, 15, 10, 0, tzinfo=UTC),
+                datetime(2025, 1, 15, 10, 5, tzinfo=UTC),
+                datetime(2025, 1, 15, 10, 0, tzinfo=UTC),  # Duplicate of first
+                datetime(2025, 1, 15, 10, 10, tzinfo=UTC),
+            ],
+            "open": [
+                42000.0,
+                42050.0,
+                42000.1,
+                42100.0,
+            ],  # Note: different open for duplicate
+            "high": [42100.0, 42150.0, 42100.1, 42200.0],
+            "low": [41900.0, 41950.0, 41900.1, 42000.0],
+            "close": [42050.0, 42100.0, 42050.1, 42150.0],
+            "volume": [1000.0, 800.0, 800.0, 600.0],
+        }
+    )
+
+    # Save the data (should deduplicate)
+    client.save(df_with_duplicates, "BTC/USD", "5m")
+
+    # Load and verify deduplication
+    loaded = client.load("BTC/USD", "5m", year=2025, month=1)
+
+    # Should have only 3 unique timestamps (deduplicated)
+    assert len(loaded) == 3, f"Expected 3 rows after deduplication, got {len(loaded)}"
+
+    # Verify the first entry is kept (not the duplicate)
+    # The first entry should have open=42000.0 (the original)
+    assert loaded["open"][0] == 42000.0, "Should keep first occurrence"
+
+
+def test_save_appends_correctly(tmp_path):
+    """Test that save correctly appends to existing parquet."""
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+
+    # Create and save initial data
+    initial_df = pl.DataFrame(
+        {
+            "timestamp": [
+                datetime(2025, 1, 15, 10, 0, tzinfo=UTC),
+                datetime(2025, 1, 15, 10, 5, tzinfo=UTC),
+            ],
+            "open": [42000.0, 42050.0],
+            "high": [42100.0, 42150.0],
+            "low": [41900.0, 41950.0],
+            "close": [42050.0, 42100.0],
+            "volume": [1000.0, 800.0],
+        }
+    )
+    client.save(initial_df, "BTC/USD", "5m")
+
+    # Create additional data to append (same month)
+    additional_df = pl.DataFrame(
+        {
+            "timestamp": [
+                datetime(2025, 1, 15, 10, 10, tzinfo=UTC),
+                datetime(2025, 1, 15, 10, 15, tzinfo=UTC),
+            ],
+            "open": [42100.0, 42150.0],
+            "high": [42200.0, 42250.0],
+            "low": [42000.0, 42050.0],
+            "close": [42150.0, 42200.0],
+            "volume": [600.0, 500.0],
+        }
+    )
+    client.save(additional_df, "BTC/USD", "5m")
+
+    # Load and verify both are present
+    loaded = client.load("BTC/USD", "5m", year=2025, month=1)
+
+    # Should have all 4 rows
+    assert len(loaded) == 4, f"Expected 4 rows after append, got {len(loaded)}"
+
+    # Verify data is sorted by timestamp
+    assert loaded["timestamp"].is_sorted(), "Data should be sorted by timestamp"
+
+
+def test_date_boundary_crossing(tmp_path):
+    """Test data spanning month boundaries saves correctly."""
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+
+    # Create data spanning month boundary (Jan 31 to Feb 1)
+    boundary_df = pl.DataFrame(
+        {
+            "timestamp": [
+                datetime(2025, 1, 31, 22, 0, tzinfo=UTC),
+                datetime(2025, 1, 31, 23, 0, tzinfo=UTC),
+                datetime(2025, 2, 1, 0, 0, tzinfo=UTC),
+                datetime(2025, 2, 1, 1, 0, tzinfo=UTC),
+            ],
+            "open": [42000.0, 42100.0, 42200.0, 42300.0],
+            "high": [42100.0, 42200.0, 42300.0, 42400.0],
+            "low": [41900.0, 42000.0, 42100.0, 42200.0],
+            "close": [42100.0, 42200.0, 42300.0, 42400.0],
+            "volume": [1000.0, 800.0, 600.0, 500.0],
+        }
+    )
+
+    # Save the data
+    client.save(boundary_df, "BTC/USD", "1h")
+
+    # Verify both month files were created
+    jan_path = (
+        tmp_path / "coinbase" / "ohlcv" / "btc-usd" / "1h" / "2025" / "01.parquet"
+    )
+    feb_path = (
+        tmp_path / "coinbase" / "ohlcv" / "btc-usd" / "1h" / "2025" / "02.parquet"
+    )
+
+    assert jan_path.exists(), "January file should exist"
+    assert feb_path.exists(), "February file should exist"
+
+    # Load and verify each month separately
+    jan_data = client.load("BTC/USD", "1h", year=2025, month=1)
+    feb_data = client.load("BTC/USD", "1h", year=2025, month=2)
+
+    assert len(jan_data) == 2, f"Expected 2 rows in January, got {len(jan_data)}"
+    assert len(feb_data) == 2, f"Expected 2 rows in February, got {len(feb_data)}"
+
+    # Verify January timestamps
+    assert jan_data["timestamp"][0].month == 1
+    assert jan_data["timestamp"][1].month == 1
+
+    # Verify February timestamps
+    assert feb_data["timestamp"][0].month == 2
+    assert feb_data["timestamp"][1].month == 2
+
+    # Load all data and verify
+    all_data = client.load("BTC/USD", "1h", year=2025)
+    assert len(all_data) == 4, f"Expected 4 total rows, got {len(all_data)}"
+    assert all_data["timestamp"].is_sorted(), "Data should be sorted by timestamp"

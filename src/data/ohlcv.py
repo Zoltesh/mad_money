@@ -383,6 +383,10 @@ class CoinbaseDataClient:
         else:
             end_ts = int(current_ts)
 
+        # Validate date order: start_date must be before or equal to end_date
+        if start_ts > end_ts:
+            return pl.DataFrame(schema=OHLCV_SCHEMA)
+
         # Calculate expected batches for progress tracking
         expected_batches = calculate_expected_batches(start_ts, end_ts, timeframe)
         expected_candles = self._calculate_expected_candles(start_ts, end_ts, timeframe)

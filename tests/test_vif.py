@@ -326,6 +326,72 @@ def test_vif_highly_correlated():
     assert (result["VIF"] > 10).all()
 
 
+def test_vif_nan_drop_na_false():
+    """Test that NaN with drop_na=False raises ValueError."""
+    df = pl.DataFrame(
+        {
+            "a": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "b": [2.0, 4.0, 6.0, 8.0, None],  # Contains NaN
+            "c": [1.5, 2.5, 3.5, 4.5, 5.5],
+        }
+    )
+
+    with pytest.raises(ValueError, match="missing values"):
+        variance_inflation_factor(df, drop_na=False)
+
+
+def test_vif_nan_drop_na_true():
+    """Test that NaN with drop_na=True drops rows with NaN."""
+    df = pl.DataFrame(
+        {
+            "a": [1.0, 2.0, 3.0, 4.0, None],
+            "b": [2.0, 4.0, 6.0, 8.0, 10.0],
+            "c": [1.5, 2.5, 3.5, 4.5, 5.5],
+        }
+    )
+
+    # Should drop the row with NaN (last row)
+    result = variance_inflation_factor(df, drop_na=True)
+
+    # Should have 3 features
+    assert len(result) == 3
+    # All VIFs should be >= 1.0
+    assert (result["VIF"] >= 1.0).all()
+
+
+def test_vif_all_nan_column():
+    """Test handling of column with all NaN values.
+
+    When a column is all NaN, Polars infers it as 'null' dtype which is
+    not numeric. The validation correctly rejects it as a non-numeric column.
+    """
+    df = pl.DataFrame(
+        {
+            "a": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "b": [None, None, None, None, None],  # All NaN - becomes null dtype
+            "c": [1.5, 2.5, 3.5, 4.5, 5.5],
+        }
+    )
+
+    # All-NaN column becomes null dtype in Polars, which is rejected as non-numeric
+    with pytest.raises(ValueError, match="non-numeric columns found"):
+        variance_inflation_factor(df, drop_na=True)
+
+
+def test_vif_single_row():
+    """Test that single row DataFrame raises error."""
+    df = pl.DataFrame(
+        {
+            "a": [1.0],
+            "b": [2.0],
+            "c": [3.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="at least 2 observations"):
+        variance_inflation_factor(df)
+
+
 def test_vif_extreme_values():
     """Test VIF with extreme numeric values."""
     np.random.seed(42)
