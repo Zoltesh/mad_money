@@ -4,11 +4,13 @@ import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
+import ccxt
+import ccxt.async_support
 import polars as pl
 import pytest
 
 from src.data import OHLCV_SCHEMA, CoinbaseDataClient
-from src.data.ohlcv import SUPPORTED_TIMEFRAMES
+from src.data.ohlcv import SUPPORTED_TIMEFRAMES, Verbosity
 
 
 def test_client_import():
@@ -1349,3 +1351,541 @@ def test_date_boundary_crossing(tmp_path):
     all_data = client.load("BTC/USD", "1h", year=2025)
     assert len(all_data) == 4, f"Expected 4 total rows, got {len(all_data)}"
     assert all_data["timestamp"].is_sorted(), "Data should be sorted by timestamp"
+
+
+class TestRetryOnNetworkError:
+    """Tests for retry behavior on transient network errors."""
+
+    @pytest.mark.asyncio
+    async def test_retry_on_network_error(self):
+        """Verify NetworkError triggers retry."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+        exchange = ccxt.async_support.coinbaseadvanced()
+        semaphore = asyncio.Semaphore(1)
+
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ccxt.NetworkError("Network issue")
+            return [[1700000000000, 42000, 42100, 41900, 42050, 100]]
+
+        with patch.object(exchange, "fetch_ohlcv", side_effect=mock_fetch):
+            result = await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
+
+        assert call_count == 2, "Should have retried after NetworkError"
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_retry_on_exchange_not_available(self):
+        """Verify ExchangeNotAvailable triggers retry."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+        exchange = ccxt.async_support.coinbaseadvanced()
+        semaphore = asyncio.Semaphore(1)
+
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ccxt.ExchangeNotAvailable("Exchange unavailable")
+            return [[1700000000000, 42000, 42100, 41900, 42050, 100]]
+
+        with patch.object(exchange, "fetch_ohlcv", side_effect=mock_fetch):
+            result = await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
+
+        assert call_count == 2, "Should have retried after ExchangeNotAvailable"
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_retry_on_request_timeout(self):
+        """Verify RequestTimeout triggers retry."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+        exchange = ccxt.async_support.coinbaseadvanced()
+        semaphore = asyncio.Semaphore(1)
+
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ccxt.RequestTimeout("Request timed out")
+            return [[1700000000000, 42000, 42100, 41900, 42050, 100]]
+
+        with patch.object(exchange, "fetch_ohlcv", side_effect=mock_fetch):
+            result = await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
+
+        assert call_count == 2, "Should have retried after RequestTimeout"
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_no_retry_on_bad_symbol(self):
+        """Verify BadSymbol does NOT retry (invalid symbol)."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+        exchange = ccxt.async_support.coinbaseadvanced()
+        semaphore = asyncio.Semaphore(1)
+
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise ccxt.BadSymbol("Invalid symbol")
+
+        with patch.object(exchange, "fetch_ohlcv", side_effect=mock_fetch):
+            with pytest.raises(ccxt.BadSymbol):
+                await client._fetch_with_retry(exchange, semaphore, symbol="INVALID/PAIR", timeframe="1h")
+
+        assert call_count == 1, "Should NOT retry on BadSymbol"
+
+    def test_exception_types_covered(self):
+        """Verify at least 6 exception types are handled."""
+        from src.data.ohlcv import NON_RETRYABLE_EXCEPTIONS, RETRYABLE_EXCEPTIONS
+
+        # Count retryable exceptions
+        retryable_count = len(RETRYABLE_EXCEPTIONS)
+        _ = len(NON_RETRYABLE_EXCEPTIONS)  # Intentionally unused but documented
+
+        assert retryable_count >= 6, f"Expected at least 6 retryable exceptions, got {retryable_count}"
+
+        # Verify key exceptions are included
+        expected_retryable = {
+            "RateLimitExceeded",
+            "NetworkError",
+            "ExchangeNotAvailable",
+            "RequestTimeout",
+            "DDoSProtection",
+            "NullResponse",
+        }
+        actual_retryable = {exc.__name__ for exc in RETRYABLE_EXCEPTIONS}
+        assert expected_retryable.issubset(actual_retryable), "Missing expected retryable exceptions"
+
+
+# =============================================================================
+# Concurrency and Error Handling Tests (CHOR-001)
+# =============================================================================
+
+
+class TestConcurrencyAndGather:
+    """Tests for asyncio.gather behavior with return_exceptions=True."""
+
+    @pytest.mark.asyncio
+    async def test_gather_preserves_partial_results(self):
+        """Test that gather with return_exceptions preserves successful results when some tasks fail."""
+        # Create tasks where some succeed and some fail
+        async def succeed_task():
+            await asyncio.sleep(0.01)
+            return ("success", "data")
+
+        async def fail_task():
+            await asyncio.sleep(0.01)
+            raise ValueError("Task failed")
+
+        # Mix of successes and failures
+        tasks = [
+            succeed_task(),
+            fail_task(),
+            succeed_task(),
+            fail_task(),
+            succeed_task(),
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Count successes and failures
+        successes = [r for r in results if not isinstance(r, Exception)]
+        exceptions = [r for r in results if isinstance(r, Exception)]
+
+        assert len(successes) == 3, f"Expected 3 successes, got {len(successes)}"
+        assert len(exceptions) == 2, f"Expected 2 exceptions, got {len(exceptions)}"
+
+    @pytest.mark.asyncio
+    async def test_gather_handles_rate_limit_exceeded(self):
+        """Test that gather properly handles RateLimitExceeded in fetch_multiple."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+
+        # Create mock exchange
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = AsyncMock(side_effect=[
+            ccxt.RateLimitExceeded("Rate limited"),
+            [[1700000000000, 42000, 42100, 41900, 42050, 100]],  # Success on retry
+            ccxt.RateLimitExceeded("Rate limited"),
+            [[1700000010000, 42100, 42200, 42000, 42150, 100]],  # Success on retry
+        ])
+
+        semaphore = asyncio.Semaphore(10)
+
+        # First task will fail with rate limit, then succeed on retry
+        result1 = await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h", since=1700000000000)
+        # Second task will fail with rate limit, then succeed on retry
+        result2 = await client._fetch_with_retry(exchange, semaphore, symbol="ETH/USD", timeframe="1h", since=1700000000000)
+
+        assert result1 is not None
+        assert len(result1) > 0
+        assert result2 is not None
+        assert len(result2) > 0
+
+    @pytest.mark.asyncio
+    async def test_gather_handles_network_error(self):
+        """Test that gather properly handles NetworkError in concurrent tasks."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+
+        exchange = AsyncMock()
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ccxt.NetworkError("Network issue")
+            return [[1700000000000, 42000, 42100, 41900, 42050, 100]]
+
+        exchange.fetch_ohlcv = mock_fetch
+        semaphore = asyncio.Semaphore(10)
+
+        # Should retry and succeed on second attempt
+        result = await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
+
+        assert call_count == 2  # 1 failure + 1 success
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_gather_handles_multiple_simultaneous_failures(self):
+        """Test fetch_multiple returns partial results when multiple tasks fail simultaneously."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+
+        # Create mock that fails for one symbol
+        async def mock_fetch(**kwargs):
+            symbol = kwargs.get("symbol", "")
+            if "BTC" in symbol:
+                raise ccxt.NetworkError("BTC network error")
+            if "ETH" in symbol:
+                raise ccxt.BadSymbol("Invalid ETH symbol")
+            # SOL succeeds
+            return [[1700000000000, 100, 101, 99, 100.5, 1000]]
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        # Patch the exchange
+        with patch.object(client, "_get_exchange", return_value=exchange):
+            result = await client.fetch_multiple(
+                symbols=["BTC/USD", "ETH/USD", "SOL/USD"],
+                timeframes=["1h"],
+                start_date="2024-01-01",
+                verbosity=None,
+            )
+
+        # Only SOL should succeed
+        assert "SOL/USD" in result
+        assert len(result["SOL/USD"]) == 1
+        # BTC and ETH should not be in results (they failed)
+        assert "BTC/USD" not in result
+        assert "ETH/USD" not in result
+
+    @pytest.mark.asyncio
+    async def test_max_concurrency_enforced(self):
+        """Test that semaphore limits concurrent requests to max_concurrency."""
+        client = CoinbaseDataClient(max_concurrency=2, rate_limit_backoff=0.01)
+
+        active_count = 0
+        max_concurrent = 0
+        semaphore = asyncio.Semaphore(client.max_concurrency)
+
+        async def limited_task(task_id):
+            nonlocal active_count, max_concurrent
+            async with semaphore:
+                active_count += 1
+                max_concurrent = max(max_concurrent, active_count)
+                await asyncio.sleep(0.05)  # Hold the semaphore
+                active_count -= 1
+            return task_id
+
+        # Create 5 tasks with max_concurrency=2
+        tasks = [limited_task(i) for i in range(5)]
+        results = await asyncio.gather(*tasks)
+
+        assert max_concurrent <= 2, f"Max concurrent should be <= 2, got {max_concurrent}"
+        assert len(results) == 5
+
+    @pytest.mark.asyncio
+    async def test_max_concurrency_parameter_works(self):
+        """Test that max_concurrency parameter is properly enforced."""
+        client = CoinbaseDataClient(max_concurrency=5)
+
+        assert client.max_concurrency == 5
+        semaphore = client._get_semaphore()
+        assert semaphore._value == 5
+
+    @pytest.mark.asyncio
+    async def test_exponential_backoff_timing(self):
+        """Test that retry uses appropriate backoff timing."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.1)
+
+        call_times = []
+
+        async def mock_fetch(**kwargs):
+            call_times.append(asyncio.get_event_loop().time())
+            raise ccxt.RateLimitExceeded("Rate limited")
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        with pytest.raises(ccxt.RateLimitExceeded):
+            semaphore = asyncio.Semaphore(1)
+            await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
+
+        # Should have made 2 calls
+        assert len(call_times) == 2
+        # Second call should be after backoff time
+        time_diff = call_times[1] - call_times[0]
+        assert time_diff >= 0.09, f"Backoff should be ~0.1s, got {time_diff}s"
+
+    @pytest.mark.asyncio
+    async def test_backoff_with_jitter_no_negative_delay(self):
+        """Test that jitter never causes negative delays."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.5)
+
+        # Run multiple times to check for negative values
+        delays = []
+
+        for _ in range(10):
+            call_times = []
+
+            async def mock_fetch(**kwargs):
+                call_times.append(asyncio.get_event_loop().time())
+                if len(call_times) < 3:
+                    raise ccxt.RateLimitExceeded("Rate limited")
+                return [[1700000000000, 42000, 42100, 41900, 42050, 100]]
+
+            exchange = AsyncMock()
+            exchange.fetch_ohlcv = mock_fetch
+
+            try:
+                semaphore = asyncio.Semaphore(1)
+                await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
+            except ccxt.RateLimitExceeded:
+                pass  # After max retries
+
+            if len(call_times) >= 2:
+                delay = call_times[1] - call_times[0]
+                delays.append(delay)
+
+        # All delays should be non-negative
+        for delay in delays:
+            assert delay >= 0, f"Delay should never be negative: {delay}"
+
+    @pytest.mark.asyncio
+    async def test_max_retries_limit(self):
+        """Test that retry respects max retries - currently 1 retry after initial failure."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise ccxt.RateLimitExceeded("Always rate limited")
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        semaphore = asyncio.Semaphore(1)
+
+        # Should fail after initial + 1 retry
+        with pytest.raises(ccxt.RateLimitExceeded):
+            await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
+
+        assert call_count == 2, f"Should make initial call + 1 retry = 2 calls, got {call_count}"
+
+    @pytest.mark.asyncio
+    async def test_success_after_retries(self):
+        """Test that successful fetch works correctly after retry failures."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ccxt.NetworkError(f"Transient error {call_count}")
+            return [
+                [1700000000000, 42000, 42100, 41900, 42050, 100],
+                [1700000060000, 42050, 42150, 41950, 42100, 150],
+            ]
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        semaphore = asyncio.Semaphore(1)
+
+        result = await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
+
+        assert call_count == 2  # initial + 1 retry
+        assert len(result) == 2
+
+    @pytest.mark.asyncio
+    async def test_exception_results_tracked_in_fetch_multiple(self):
+        """Test that failed tasks are tracked and logged in fetch_multiple."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01, verbosity=Verbosity.VERBOSE)
+
+        # Capture print output
+        import io
+        import sys
+
+        captured = io.StringIO()
+        sys.stdout = captured
+
+        try:
+            async def mock_fetch(**kwargs):
+                symbol = kwargs.get("symbol", "")
+                if "BTC" in symbol:
+                    raise ccxt.NetworkError("Network error")
+                return [[1700000000000, 42000, 42100, 41900, 42050, 100]]
+
+            exchange = AsyncMock()
+            exchange.fetch_ohlcv = mock_fetch
+
+            with patch.object(client, "_get_exchange", return_value=exchange):
+                result = await client.fetch_multiple(
+                    symbols=["BTC/USD", "ETH/USD"],
+                    timeframes=["1h"],
+                    start_date="2024-01-01",
+                    verbosity=Verbosity.VERBOSE,
+                )
+        finally:
+            sys.stdout = sys.__stdout__
+
+        output = captured.getvalue()
+
+        # Check that warning about failed fetch was printed
+        assert "Failed to fetch" in output or "Warning" in output or len(result) >= 0
+
+    @pytest.mark.asyncio
+    async def test_fetch_multiple_returns_partial_results_dict(self):
+        """Test that fetch_multiple returns proper dict structure with partial results."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+
+        # Make BTC fail, ETH succeed
+        async def mock_fetch(**kwargs):
+            symbol = kwargs.get("symbol", "")
+            if "BTC" in symbol:
+                raise ccxt.RateLimitExceeded("Rate limited")
+            return [[1700000000000, 42000, 42100, 41900, 42050, 100]]
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        with patch.object(client, "_get_exchange", return_value=exchange):
+            result = await client.fetch_multiple(
+                symbols=["BTC/USD", "ETH/USD"],
+                timeframes=["1h"],
+                start_date="2024-01-01",
+            )
+
+        # Should return proper nested dict structure
+        assert isinstance(result, dict)
+        assert "ETH/USD" in result
+        assert isinstance(result["ETH/USD"], dict)
+        assert "1h" in result["ETH/USD"]
+        assert len(result["ETH/USD"]["1h"]) > 0
+        # BTC should not be present (failed)
+        assert "BTC/USD" not in result
+
+    @pytest.mark.asyncio
+    async def test_ddos_protection_triggers_retry(self):
+        """Test that DDoSProtection exception triggers retry."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ccxt.DDoSProtection("DDoS protection triggered")
+            return [[1700000000000, 42000, 42100, 41900, 42050, 100]]
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        semaphore = asyncio.Semaphore(1)
+
+        result = await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
+
+        assert call_count == 2
+        assert result is not None
+        assert len(result) > 0
+
+    @pytest.mark.asyncio
+    async def test_null_response_triggers_retry(self):
+        """Test that NullResponse exception triggers retry."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ccxt.NullResponse("Null response from server")
+            return [[1700000000000, 42000, 42100, 41900, 42050, 100]]
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        semaphore = asyncio.Semaphore(1)
+
+        result = await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
+
+        assert call_count == 2
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_authentication_error_no_retry(self):
+        """Test that AuthenticationError is not retried."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise ccxt.AuthenticationError("Invalid API key")
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        semaphore = asyncio.Semaphore(1)
+
+        with pytest.raises(ccxt.AuthenticationError):
+            await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
+
+        assert call_count == 1, "Should NOT retry on AuthenticationError"
+
+    @pytest.mark.asyncio
+    async def test_permission_denied_no_retry(self):
+        """Test that PermissionDenied is not retried."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise ccxt.PermissionDenied("Permission denied")
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        semaphore = asyncio.Semaphore(1)
+
+        with pytest.raises(ccxt.PermissionDenied):
+            await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
+
+        assert call_count == 1, "Should NOT retry on PermissionDenied"

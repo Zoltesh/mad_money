@@ -1,6 +1,7 @@
 """OHLCV data retrieval from Coinbase."""
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -18,6 +19,8 @@ from src.data.progress import (
     _is_test_environment,
     calculate_expected_batches,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Verbosity(Enum):
@@ -46,6 +49,24 @@ COINBASE_CANDLE_LIMIT = 300
 
 # Progress update interval: batch progress updates to reduce contention in concurrent operations
 PROGRESS_UPDATE_INTERVAL = 10
+
+# Retryable exceptions that should trigger a retry attempt
+RETRYABLE_EXCEPTIONS = (
+    ccxt.RateLimitExceeded,
+    ccxt.NetworkError,
+    ccxt.ExchangeNotAvailable,
+    ccxt.RequestTimeout,
+    ccxt.DDoSProtection,
+    ccxt.NullResponse,
+)
+
+# Permanent exceptions that should not be retried - log and re-raise
+NON_RETRYABLE_EXCEPTIONS = (
+    ccxt.BadSymbol,
+    ccxt.AuthenticationError,
+    ccxt.PermissionDenied,
+    ccxt.InvalidNonce,
+)
 
 
 class CoinbaseDataClient:
@@ -362,9 +383,14 @@ class CoinbaseDataClient:
         async with semaphore:
             try:
                 return await exchange.fetch_ohlcv(**kwargs)
-            except ccxt.RateLimitExceeded:
+            except RETRYABLE_EXCEPTIONS:
+                # Transient error - retry once after backoff
                 await asyncio.sleep(self.rate_limit_backoff)
                 return await exchange.fetch_ohlcv(**kwargs)
+            except NON_RETRYABLE_EXCEPTIONS as e:
+                # Permanent error - log and re-raise
+                logger.warning("Non-retryable exception: %s - %s", type(e).__name__, e)
+                raise
 
     async def fetch(
         self,

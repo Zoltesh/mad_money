@@ -20,14 +20,14 @@ pytest           # Run tests
 uv sync --group dev
 
 # Run a specific test file
-pytest tests/test_vif.py
+uv run pytest tests/test_vif.py
 
 # Run a specific test
-pytest tests/test_vif.py::test_vif_basic
+uv run pytest tests/test_vif.py::test_vif_basic
 
 # Lint, format, and type check code
-ruff check .
-ruff format .
+uv run ruff check .
+uv run ruff format .
 uv run ty .
 ```
 
