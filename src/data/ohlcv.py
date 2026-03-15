@@ -6,7 +6,6 @@ import random
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 import ccxt
@@ -14,12 +13,15 @@ import ccxt.async_support
 import polars as pl
 from rich.progress import Progress
 
+from src.data.ohlcv_fetch import execute_fetch, execute_fetch_multiple
+from src.data.ohlcv_storage import load_partitions, save_partitions, symbol_to_path
 from src.data.progress import (
     TIMEFRAME_SECONDS,
     ProgressTracker,
     RichProgressManager,
     _is_test_environment,
     calculate_expected_batches,
+    get_progress_color,
 )
 
 logger = logging.getLogger(__name__)
@@ -180,6 +182,16 @@ class CoinbaseDataClient:
             Effective Verbosity level to use.
         """
         return verbosity if verbosity is not None else self.verbosity
+
+    @staticmethod
+    def _progress_tracker_factory(**kwargs: Any) -> ProgressTracker:
+        """Factory for progress tracker instances used by fetch engine."""
+        return RichProgressManager(**kwargs)
+
+    @staticmethod
+    async def _gather_with_exceptions(tasks: list[Any]) -> list[Any]:
+        """Gather tasks while preserving exceptions in results."""
+        return await asyncio.gather(*tasks, return_exceptions=True)
 
     @staticmethod
     def _apply_end_of_day(dt: datetime, end_of_day: bool) -> datetime:
@@ -451,6 +463,7 @@ class CoinbaseDataClient:
             timeframe: Timeframe for candles (e.g., "1m", "5m", "1h").
             start_date: Start date for data retrieval.
             end_date: End date for data retrieval. Defaults to latest.
+                Note: short/sparse batches do not imply completion by themselves.
             verbosity: Override verbosity level for this call.
             progress_task_id: Task ID from shared Rich Progress (for fetch_multiple).
             shared_progress: Shared Rich Progress instance (for fetch_multiple).
@@ -463,214 +476,27 @@ class CoinbaseDataClient:
         Raises:
             ValueError: If timeframe is not supported.
         """
-        # Use instance verbosity if not overridden
-        effective_verbosity = self._resolve_verbosity(verbosity)
-        self._validate_timeframe(timeframe)
-
-        exchange = self._get_exchange()
-        semaphore = self._get_semaphore()
-
-        start_ts = int(self._parse_date(start_date).timestamp() * 1000)
-        end_ts: int | None = None
-        current_ts = datetime.now(UTC).timestamp() * 1000
-        if end_date:
-            end_ts = int(self._parse_date(end_date, end_of_day=True).timestamp() * 1000)
-        else:
-            end_ts = int(current_ts)
-
-        # Validate date order: start_date must be before or equal to end_date
-        if start_ts > end_ts:
-            return pl.DataFrame(schema=OHLCV_SCHEMA)
-
-        # Calculate expected batches for progress tracking
-        expected_batches = calculate_expected_batches(start_ts, end_ts, timeframe)
-        expected_candles = self._calculate_expected_candles(start_ts, end_ts, timeframe)
-
-        # Determine if we use shared progress or create our own
-        use_shared_progress = (
-            shared_progress is not None and progress_task_id is not None
-        )
-
-        # Initialize progress tracker if verbosity is enabled and not using shared
-        progress_tracker: ProgressTracker | None = None
-        if effective_verbosity != Verbosity.DISABLED and not use_shared_progress:
-            progress_tracker = RichProgressManager(
-                total=expected_batches,
-                symbol=symbol,
-                timeframe=timeframe,
-                verbosity=effective_verbosity,
-            )
-            progress_tracker.start()
-
-            # Verbose mode: print start message
-            if effective_verbosity == Verbosity.VERBOSE:
-                end_display = end_date if end_date else "latest"
-                print(
-                    f"Starting fetch for {symbol} {timeframe} from {start_date} to {end_display}..."
-                )
-
-        all_candles: list[list[float]] = []
-        timeframe_ms = TIMEFRAME_SECONDS[timeframe] * 1000
-        since = start_ts
-        pending_advance = 0  # For batching progress updates (TASK-008)
-        failed_batches = 0  # Track failed batches for reporting
-        consecutive_failed_batches = 0
-        total_candles_fetched = 0
-
-        try:
-            while since is not None:
-                # Exit if we've passed the end date
-                if end_ts and since > end_ts:
-                    break
-
-                # Fetch next batch with semaphore and rate limit handling
-                try:
-                    candles = await self._fetch_batch(
-                        exchange, semaphore, symbol, timeframe, int(since)
-                    )
-                except NON_RETRYABLE_EXCEPTIONS:
-                    # Non-retryable errors should halt the entire fetch
-                    raise
-                except RETRYABLE_EXCEPTIONS as e:
-                    # After exhausting retries, log and skip this batch
-                    logger.warning(
-                        "Batch failed after retries for %s %s (timestamp %d): %s - %s. Continuing with remaining batches.",
-                        symbol,
-                        timeframe,
-                        since,
-                        type(e).__name__,
-                        e,
-                    )
-                    failed_batches += 1
-                    consecutive_failed_batches += 1
-
-                    # For unbounded fetches, fail fast after repeated exhausted retries.
-                    # This prevents near-infinite runtime from old start dates when the API
-                    # is unavailable or rate-limiting persistently.
-                    if (
-                        end_date is None
-                        and consecutive_failed_batches
-                        >= MAX_CONSECUTIVE_RETRYABLE_FAILURES_NO_END_DATE
-                    ):
-                        raise
-
-                    # Skip forward by one full API batch window instead of one candle.
-                    # This guarantees forward progress and avoids very long loops.
-                    since = since + (timeframe_ms * COINBASE_CANDLE_LIMIT)
-                    pending_advance = self._update_progress(
-                        pending_advance,
-                        progress_task_id,
-                        shared_progress,
-                        progress_tracker,
-                        use_shared_progress,
-                        total_candles_fetched,
-                        expected_candles,
-                    )
-                    continue
-
-                # Handle empty result - exit cleanly
-                if not candles:
-                    self._flush_progress(
-                        pending_advance,
-                        progress_task_id,
-                        shared_progress,
-                        progress_tracker,
-                        use_shared_progress,
-                        extra=1,
-                    )
-                    break
-
-                # Process the batch
-                consecutive_failed_batches = 0
-                last_candle_ts = candles[-1][0]
-                batch_candles = candles
-
-                # Filter to end_date boundary before processing callback/collection
-                if end_ts is not None:
-                    batch_candles = [c for c in batch_candles if c[0] <= end_ts]
-
-                if batch_candles:
-                    total_candles_fetched += len(batch_candles)
-                    if collect_results:
-                        all_candles.extend(batch_candles)
-                    if on_batch is not None:
-                        await on_batch(self._candles_to_dataframe(batch_candles))
-
-                # Update progress tracking
-                pending_advance = self._update_progress(
-                    pending_advance,
-                    progress_task_id,
-                    shared_progress,
-                    progress_tracker,
-                    use_shared_progress,
-                    total_candles_fetched,
-                    expected_candles,
-                )
-
-                # Check exit conditions and set next batch timestamp.
-                # When end_date is provided, we stop only after passing it.
-                if end_ts and last_candle_ts >= end_ts:
-                    self._flush_progress(
-                        pending_advance,
-                        progress_task_id,
-                        shared_progress,
-                        progress_tracker,
-                        use_shared_progress,
-                    )
-                    since = None
-                else:
-                    # Always advance by full timeframe to avoid duplicate final candles.
-                    next_since = last_candle_ts + timeframe_ms
-
-                    # Monotonic guard: if exchange returns stale/overlapping data, still advance.
-                    if next_since <= since:
-                        next_since = since + timeframe_ms
-
-                    # Exchange may occasionally return stale data windows that don't advance.
-                    # Stop to avoid infinite loops when data is no longer progressing.
-                    if last_candle_ts < since:
-                        self._flush_progress(
-                            pending_advance,
-                            progress_task_id,
-                            shared_progress,
-                            progress_tracker,
-                            use_shared_progress,
-                        )
-                        since = None
-                    else:
-                        since = next_since
-
-            # Log summary of batch results
-            if failed_batches > 0:
-                logger.warning(
-                    "Fetch completed for %s %s: %d candles fetched, %d batches failed",
-                    symbol,
-                    timeframe,
-                    len(all_candles),
-                    failed_batches,
-                )
-        finally:
-            # Always close progress tracker (only if we created our own)
-            if progress_tracker is not None:
-                progress_tracker.close()
-
-                # Verbose mode: print completion message
-                if effective_verbosity == Verbosity.VERBOSE:
-                    print(
-                        f"Completed fetch for {symbol} {timeframe}: {len(all_candles)} candles fetched"
-                    )
-
-        if not collect_results:
-            return pl.DataFrame(schema=OHLCV_SCHEMA)
-
-        if not all_candles:
-            return pl.DataFrame(schema=OHLCV_SCHEMA)
-
-        # Convert to Polars DataFrame and normalize ordering/deduplication.
-        return (
-            self._candles_to_dataframe(all_candles)
-            .unique(subset=["timestamp"], keep="last")
-            .sort("timestamp")
+        return await execute_fetch(
+            client=self,
+            symbol=symbol,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            verbosity=verbosity,
+            progress_task_id=progress_task_id,
+            shared_progress=shared_progress,
+            on_batch=on_batch,
+            collect_results=collect_results,
+            verbosity_disabled=Verbosity.DISABLED,
+            verbosity_verbose=Verbosity.VERBOSE,
+            ohlcv_schema=OHLCV_SCHEMA,
+            timeframe_seconds=TIMEFRAME_SECONDS,
+            calculate_expected_batches=calculate_expected_batches,
+            coinbase_candle_limit=COINBASE_CANDLE_LIMIT,
+            max_consecutive_retryable_failures_no_end_date=MAX_CONSECUTIVE_RETRYABLE_FAILURES_NO_END_DATE,
+            retryable_exceptions=RETRYABLE_EXCEPTIONS,
+            non_retryable_exceptions=NON_RETRYABLE_EXCEPTIONS,
+            logger=logger,
         )
 
     @staticmethod
@@ -683,7 +509,7 @@ class CoinbaseDataClient:
         Returns:
             Path-friendly string (e.g., "btc-usd").
         """
-        return symbol.replace("/", "-").lower()
+        return symbol_to_path(symbol)
 
     def save(
         self,
@@ -701,64 +527,12 @@ class CoinbaseDataClient:
         Raises:
             ValueError: If DataFrame is empty or missing required columns.
         """
-        # Handle empty DataFrame
-        if df.is_empty():
-            return
-
-        # Validate required columns
-        required_cols = {"timestamp", "open", "high", "low", "close", "volume"}
-        df_cols = set(df.columns)
-        if not required_cols.issubset(df_cols):
-            missing = required_cols - df_cols
-            raise ValueError(f"DataFrame missing required columns: {missing}")
-
-        # Normalize symbol to path-friendly format (e.g., BTC/USD -> btc-usd)
-        pair_path = self._symbol_to_path(symbol)
-
-        # Extract year and month for partitioning
-        df_with_partition = df.with_columns(
-            [
-                pl.col("timestamp").dt.year().alias("year"),
-                pl.col("timestamp").dt.month().alias("month"),
-            ]
+        save_partitions(
+            data_dir=self.data_dir,
+            df=df,
+            symbol=symbol,
+            timeframe=timeframe,
         )
-
-        # Group by year-month and save each partition
-        for (year, month), partition_df in df_with_partition.group_by(
-            ["year", "month"]
-        ):
-            # Build directory path
-            dir_path = (
-                Path(self.data_dir)
-                / "coinbase"
-                / "ohlcv"
-                / pair_path
-                / timeframe
-                / str(year)
-            )
-            dir_path.mkdir(parents=True, exist_ok=True)
-
-            # Build file path
-            file_path = dir_path / f"{month:02d}.parquet"
-
-            # Load existing data if file exists and append with deduplication
-            if file_path.exists():
-                existing_df = pl.read_parquet(file_path)
-                existing_df = existing_df.filter(
-                    (pl.col("timestamp").dt.year() == int(year))
-                    & (pl.col("timestamp").dt.month() == int(month))
-                )
-                # Combine and remove duplicates based on timestamp
-                combined_df = pl.concat(
-                    [existing_df, partition_df.drop(["year", "month"])]
-                )
-                combined_df = combined_df.unique(subset=["timestamp"], keep="last")
-                combined_df = combined_df.sort("timestamp")
-                combined_df.write_parquet(file_path)
-            else:
-                partition_df.drop(["year", "month"]).sort("timestamp").write_parquet(
-                    file_path
-                )
 
     async def save_async(
         self,
@@ -916,67 +690,14 @@ class CoinbaseDataClient:
         Raises:
             ValueError: If month is specified without year.
         """
-        # Validate month without year
-        if month is not None and year is None:
-            raise ValueError("year must be specified when month is provided")
-
-        # Validate month range
-        if month is not None and (month < 1 or month > 12):
-            raise ValueError(f"month must be between 1 and 12, got {month}")
-
-        # Normalize symbol to path-friendly format
-        pair_path = self._symbol_to_path(symbol)
-
-        # Build base path
-        base_path = Path(self.data_dir) / "coinbase" / "ohlcv" / pair_path / timeframe
-
-        # If no base directory exists, return empty DataFrame
-        if not base_path.exists():
-            return pl.DataFrame(schema=OHLCV_SCHEMA)
-
-        # Collect all parquet files to read
-        parquet_files: list[Path] = []
-
-        if year is not None:
-            # Look in specific year directory
-            year_path = base_path / str(year)
-            if year_path.exists():
-                parquet_files = list(year_path.glob("*.parquet"))
-        else:
-            # No year specified - scan all year directories
-            for year_dir in base_path.iterdir():
-                if year_dir.is_dir():
-                    parquet_files.extend(year_dir.glob("*.parquet"))
-
-        if not parquet_files:
-            return pl.DataFrame(schema=OHLCV_SCHEMA)
-
-        # Filter by month if specified
-        if month is not None:
-            month_str = f"{month:02d}.parquet"
-            parquet_files = [f for f in parquet_files if f.name == month_str]
-
-            if not parquet_files:
-                return pl.DataFrame(schema=OHLCV_SCHEMA)
-
-        # Read and combine all parquet files
-        dfs = []
-        for file_path in sorted(parquet_files):
-            df = pl.read_parquet(file_path)
-            dfs.append(df)
-
-        if not dfs:
-            return pl.DataFrame(schema=OHLCV_SCHEMA)
-
-        combined_df = pl.concat(dfs)
-
-        # Sort by timestamp
-        combined_df = combined_df.sort("timestamp")
-
-        # Remove duplicates based on timestamp
-        combined_df = combined_df.unique(subset=["timestamp"], keep="first")
-
-        return combined_df
+        return load_partitions(
+            data_dir=self.data_dir,
+            ohlcv_schema=OHLCV_SCHEMA,
+            symbol=symbol,
+            timeframe=timeframe,
+            year=year,
+            month=month,
+        )
 
     async def fetch_multiple(
         self,
@@ -998,135 +719,20 @@ class CoinbaseDataClient:
         Returns:
             Nested dict: {symbol: {timeframe: DataFrame}}
         """
-        # Use instance verbosity if not overridden
-        effective_verbosity = self._resolve_verbosity(verbosity)
-
-        # Build list of all symbol/timeframe combinations
-        combinations = [(s, t) for s in symbols for t in timeframes]
-
-        # Verbose mode: print batch start message
-        if effective_verbosity == Verbosity.VERBOSE:
-            end_display = end_date if end_date else "latest"
-            print(
-                f"Starting batch fetch for {len(combinations)} symbol/timeframe combinations "
-                f"from {start_date} to {end_display}..."
-            )
-
-        # Create shared Rich Progress if verbosity is enabled
-        shared_progress: Progress | None = None
-        task_ids: dict[tuple[str, str], Any] = {}
-        if effective_verbosity != Verbosity.DISABLED:
-            from rich.progress import (
-                BarColumn,
-                SpinnerColumn,
-                TextColumn,
-                TimeRemainingColumn,
-            )
-
-            from src.data.progress import get_progress_color
-
-            # Create one progress for all tasks
-            shared_progress = Progress(
-                SpinnerColumn(),
-                TextColumn("[bold]{task.description}"),
-                BarColumn(),
-                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                TextColumn("({task.completed}/{task.total} batches)"),
-                TimeRemainingColumn(),
-            )
-            shared_progress.start()
-
-            # Add all tasks upfront with expected batches
-            # Calculate expected batches for each timeframe
-            start_ts = int(self._parse_date(start_date).timestamp() * 1000)
-            end_ts: int
-            if end_date:
-                end_ts = int(
-                    self._parse_date(end_date, end_of_day=True).timestamp() * 1000
-                )
-            else:
-                end_ts = int(datetime.now(UTC).timestamp() * 1000)
-
-            for symbol, timeframe in combinations:
-                color = get_progress_color(symbol, timeframe)
-                description = f"[{color}]{symbol} {timeframe}[/{color}]"
-                # Calculate expected batches for this specific timeframe
-                expected_batches = calculate_expected_batches(
-                    start_ts, end_ts, timeframe
-                )
-                task_id = shared_progress.add_task(description, total=expected_batches)
-                task_ids[(symbol, timeframe)] = task_id
-
-        # Build list of all fetch tasks with their task IDs
-        async def fetch_one(
-            symbol: str, timeframe: str, task_id: Any
-        ) -> tuple[str, str, pl.DataFrame]:
-            df = await self.fetch(
-                symbol,
-                timeframe,
-                start_date,
-                end_date,
-                effective_verbosity,
-                progress_task_id=task_id,
-                shared_progress=shared_progress,
-            )
-            return (symbol, timeframe, df)
-
-        # Create all tasks with their metadata (symbol, timeframe)
-        tasks = []
-        task_metadata = []  # Track (symbol, timeframe) for each task
-        for symbol, timeframe in combinations:
-            task_id = task_ids.get((symbol, timeframe))
-            tasks.append(fetch_one(symbol, timeframe, task_id))
-            task_metadata.append((symbol, timeframe))
-
-        # Run all concurrently with return_exceptions to preserve partial results
-        # If any task fails, others continue and results are preserved
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Build nested dict structure, handling exceptions from failed tasks
-        result_dict: dict[str, dict[str, pl.DataFrame]] = {}
-        total_candles = 0
-        failed_tasks = []
-        for i, result in enumerate(results):
-            # Check if result is an exception (from return_exceptions=True)
-            # Note: Using BaseException to catch all throwables including KeyboardInterrupt
-            if isinstance(result, BaseException):
-                symbol, timeframe = task_metadata[i]
-                task_id = task_ids.get((symbol, timeframe))
-                # Update progress bar to show failure
-                if shared_progress is not None and task_id is not None:
-                    # Mark as complete but with 0% to indicate failure
-                    shared_progress.update(task_id, completed=0)
-                    # Add error message to the task description
-                    shared_progress.update(
-                        task_id,
-                        description=f"[red]{symbol} {timeframe} (failed)[/red]",
-                    )
-                failed_tasks.append((symbol, timeframe, result))
-                continue
-
-            symbol, timeframe, df = result
-            if symbol not in result_dict:
-                result_dict[symbol] = {}
-            result_dict[symbol][timeframe] = df
-            total_candles += len(df)
-
-        # Log failures for visibility
-        if failed_tasks:
-            for symbol, timeframe, exc in failed_tasks:
-                print(
-                    f"Warning: Failed to fetch {symbol}/{timeframe}: {type(exc).__name__}: {exc}"
-                )
-
-        # Verbose mode: print batch completion message
-        if effective_verbosity == Verbosity.VERBOSE:
-            print(f"Completed batch fetch: {total_candles} total candles fetched")
-
-        if shared_progress is not None:
-            shared_progress.stop()
-
-        return result_dict
+        return await execute_fetch_multiple(
+            client=self,
+            symbols=symbols,
+            timeframes=timeframes,
+            start_date=start_date,
+            end_date=end_date,
+            verbosity=verbosity,
+            verbosity_disabled=Verbosity.DISABLED,
+            verbosity_verbose=Verbosity.VERBOSE,
+            calculate_expected_batches=calculate_expected_batches,
+            logger=logger,
+            progress_class=Progress,
+            get_progress_color=get_progress_color,
+        )
 
     async def fetch_and_save(
         self,
