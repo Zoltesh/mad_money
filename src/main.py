@@ -10,7 +10,19 @@ async def main():
     """Fetch OHLCV data for multiple symbols and timeframes."""
     async with CoinbaseDataClient(verbosity=Verbosity.PROGRESS) as client:
         results = await client.fetch_multiple(
-            symbols=["BTC/USDC", "ETH/USDC", "SOL/USDC"],  # Multiple assets
+            symbols=[
+                "AVAX/USDC",
+                "ADA/USDC",
+                "BCH/USDC",
+                "BTC/USDC",
+                "ETH/USDC",
+                "DOGE/USDC",
+                "LINK/USDC",
+                "LTC/USDC",
+                "SHIB/USDC",
+                "SOL/USDC",
+                "XRP/USDC"
+                ],
             timeframes=[
                 "1m",
                 "5m",
