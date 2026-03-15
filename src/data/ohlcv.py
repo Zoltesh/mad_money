@@ -443,7 +443,6 @@ class CoinbaseDataClient:
         shared_progress: Progress | None = None,
         on_batch: Callable[[pl.DataFrame], Awaitable[None]] | None = None,
         collect_results: bool = True,
-        continue_on_short_batch: bool = False,
     ) -> pl.DataFrame:
         """Fetch historical OHLCV data from Coinbase.
 
@@ -457,8 +456,6 @@ class CoinbaseDataClient:
             shared_progress: Shared Rich Progress instance (for fetch_multiple).
             on_batch: Optional async callback executed for each fetched batch DataFrame.
             collect_results: Whether to collect all rows in-memory and return full DataFrame.
-            continue_on_short_batch: If True, keep iterating when a returned batch has
-                fewer candles than the exchange limit.
 
         Returns:
             Polars DataFrame with OHLCV columns.
@@ -629,9 +626,9 @@ class CoinbaseDataClient:
                     if next_since <= since:
                         next_since = since + timeframe_ms
 
-                    # By default (backward-compatible), short batches terminate fetch.
-                    # For sparse-history backfills, callers can opt in to continue.
-                    if not continue_on_short_batch and len(candles) < COINBASE_CANDLE_LIMIT:
+                    # Exchange may occasionally return stale data windows that don't advance.
+                    # Stop to avoid infinite loops when data is no longer progressing.
+                    if last_candle_ts < since:
                         self._flush_progress(
                             pending_advance,
                             progress_task_id,
@@ -640,22 +637,6 @@ class CoinbaseDataClient:
                             use_shared_progress,
                         )
                         since = None
-                    # With no explicit end_date, stop only when short batch is close to "now".
-                    # Small historical batches can happen due to missing candles and should not
-                    # terminate the fetch early.
-                    elif end_date is None and len(candles) < COINBASE_CANDLE_LIMIT:
-                        now_ms = int(datetime.now(UTC).timestamp() * 1000)
-                        if last_candle_ts >= (now_ms - timeframe_ms):
-                            self._flush_progress(
-                                pending_advance,
-                                progress_task_id,
-                                shared_progress,
-                                progress_tracker,
-                                use_shared_progress,
-                            )
-                            since = None
-                        else:
-                            since = next_since
                     else:
                         since = next_since
 
@@ -685,8 +666,12 @@ class CoinbaseDataClient:
         if not all_candles:
             return pl.DataFrame(schema=OHLCV_SCHEMA)
 
-        # Convert to Polars DataFrame
-        return self._candles_to_dataframe(all_candles)
+        # Convert to Polars DataFrame and normalize ordering/deduplication.
+        return (
+            self._candles_to_dataframe(all_candles)
+            .unique(subset=["timestamp"], keep="last")
+            .sort("timestamp")
+        )
 
     @staticmethod
     def _symbol_to_path(symbol: str) -> str:
@@ -1165,7 +1150,6 @@ class CoinbaseDataClient:
             verbosity=verbosity,
             on_batch=_write_batch,
             collect_results=False,
-            continue_on_short_batch=True,
         )
 
     async def fetch_multiple_and_save(

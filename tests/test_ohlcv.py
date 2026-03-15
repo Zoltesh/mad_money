@@ -967,7 +967,9 @@ def test_fetch_rate_limit_retry():
         result = asyncio.run(client.fetch("BTC/USD", "1m", "2024-01-01"))
 
     # Verify retry happened
-    assert call_count == 2, "Should have made 2 calls (initial + retry)"
+    # With sparse-batch continuation, fetch may make additional calls to continue
+    # advancing the time cursor after the first successful short batch.
+    assert call_count >= 2, "Should have made at least 2 calls (initial + retry)"
     # Verify data was returned on retry
     assert len(result) == 1
     assert result["close"][0] == 42050.0
