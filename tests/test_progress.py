@@ -283,10 +283,7 @@ class TestProgressTrackerIntegration:
     """Integration tests for ProgressTracker."""
 
     def test_progress_tracker_start_creates_pbar(self):
-        """Test that start creates tqdm progress bar when enabled."""
-        # Skip if tqdm is not available (optional dependency)
-        pytest.importorskip("tqdm")
-
+        """Test that start creates Rich progress display when enabled."""
         tracker = ProgressTracker(
             total=10,
             symbol="BTC/USD",
@@ -294,12 +291,12 @@ class TestProgressTrackerIntegration:
             verbosity=Verbosity.PROGRESS,
         )
 
-        # In a real environment with color support, this would create a pbar
-        # We just verify it doesn't crash - actual tqdm behavior tested manually
+        # In a real environment with color support, this would create a progress
+        # display. We verify it doesn't crash in test environments.
         try:
             tracker.start()
         except Exception:
-            pass  # May fail in test environment without real tqdm
+            pass  # May fail in some test environments without a real terminal
 
     def test_progress_tracker_full_lifecycle(self):
         """Test complete lifecycle: create, start, update, close."""
@@ -307,7 +304,7 @@ class TestProgressTrackerIntegration:
             total=10,
             symbol="BTC/USD",
             timeframe="1h",
-            verbosity=Verbosity.DISABLED,  # Use disabled to avoid tqdm issues in tests
+            verbosity=Verbosity.DISABLED,  # Use disabled to avoid terminal issues
         )
 
         # These should all complete without error

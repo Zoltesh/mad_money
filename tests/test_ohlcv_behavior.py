@@ -1,6 +1,7 @@
 """Lean behavior tests for OHLCV fetching and concurrency."""
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -78,6 +79,52 @@ async def test_fetch_retries_on_rate_limit_then_succeeds():
 
     assert call_count >= 2
     assert len(result) == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_retry_releases_semaphore_during_backoff():
+    """A retrying request should not hold the semaphore while sleeping."""
+    client = CoinbaseDataClient(
+        max_retries=1,
+        rate_limit_backoff=0.05,
+        min_request_interval=0.0,
+    )
+    semaphore = asyncio.Semaphore(1)
+    attempts = {1: 0, 2: 0}
+    events = []
+
+    async def mock_fetch(**kwargs):
+        since = kwargs["since"]
+        attempts[since] += 1
+        events.append((since, attempts[since], time.perf_counter()))
+        if since == 1 and attempts[since] == 1:
+            raise ccxt.RateLimitExceeded("Rate limited")
+        return [[since, 1.0, 1.0, 1.0, 1.0, 1.0]]
+
+    exchange = AsyncMock()
+    exchange.fetch_ohlcv = mock_fetch
+
+    task_a = asyncio.create_task(
+        client._fetch_with_retry(  # noqa: SLF001 - behavior validation
+            exchange, semaphore, symbol="BTC/USD", timeframe="1m", since=1, limit=1
+        )
+    )
+    await asyncio.sleep(0.005)
+    task_b = asyncio.create_task(
+        client._fetch_with_retry(  # noqa: SLF001 - behavior validation
+            exchange, semaphore, symbol="ETH/USD", timeframe="1m", since=2, limit=1
+        )
+    )
+
+    await asyncio.gather(task_a, task_b)
+
+    first_retry_idx = next(
+        i for i, (since, attempt, _) in enumerate(events) if since == 1 and attempt == 2
+    )
+    second_request_idx = next(
+        i for i, (since, attempt, _) in enumerate(events) if since == 2 and attempt == 1
+    )
+    assert second_request_idx < first_retry_idx
 
 
 @pytest.mark.asyncio

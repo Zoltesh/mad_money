@@ -97,6 +97,7 @@ class CoinbaseDataClient:
         self,
         data_dir: str = "./data",
         max_concurrency: int = 10,
+        min_request_interval: float = 0.06,
         rate_limit_backoff: float = 1.0,
         max_retries: int = 3,
         api_key: str | None = None,
@@ -108,6 +109,8 @@ class CoinbaseDataClient:
         Args:
             data_dir: Directory for storing fetched data.
             max_concurrency: Maximum number of concurrent requests.
+            min_request_interval: Minimum seconds between request starts across all
+                workers. Adds gentle global pacing to reduce 429 rate limits.
             rate_limit_backoff: Initial backoff time in seconds for rate limiting.
             max_retries: Maximum number of retry attempts with exponential backoff.
             api_key: Optional Coinbase API key for authenticated requests.
@@ -116,6 +119,7 @@ class CoinbaseDataClient:
         """
         self.data_dir = data_dir
         self.max_concurrency = max_concurrency
+        self.min_request_interval = min_request_interval
         self.rate_limit_backoff = rate_limit_backoff
         self.max_retries = max_retries
         self._api_key = api_key
@@ -134,6 +138,8 @@ class CoinbaseDataClient:
 
         self._exchange: ccxt.async_support.coinbaseadvanced | None = None
         self._semaphore: asyncio.Semaphore | None = None
+        self._request_gate: asyncio.Lock | None = None
+        self._next_request_at: float = 0.0
 
     @classmethod
     def from_settings(cls, settings, **kwargs) -> "CoinbaseDataClient":
@@ -171,6 +177,27 @@ class CoinbaseDataClient:
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self.max_concurrency)
         return self._semaphore
+
+    def _get_request_gate(self) -> asyncio.Lock:
+        """Get or create the request pacing lock."""
+        if self._request_gate is None:
+            self._request_gate = asyncio.Lock()
+        return self._request_gate
+
+    async def _wait_for_request_slot(self) -> None:
+        """Enforce minimum spacing between outbound request starts."""
+        if self.min_request_interval <= 0:
+            return
+
+        loop = asyncio.get_running_loop()
+        gate = self._get_request_gate()
+        async with gate:
+            now = loop.time()
+            delay = self._next_request_at - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+                now = loop.time()
+            self._next_request_at = max(now, self._next_request_at) + self.min_request_interval
 
     def _resolve_verbosity(self, verbosity: Verbosity | None) -> Verbosity:
         """Resolve effective verbosity level.
@@ -403,46 +430,48 @@ class CoinbaseDataClient:
         Raises:
             The last encountered exception after max_retries exhausted.
         """
-        async with semaphore:
-            last_exception: Exception | None = None
+        last_exception: Exception | None = None
 
-            # Loop through initial attempt + max_retries retries
-            for attempt in range(self.max_retries + 1):
-                try:
+        # Loop through initial attempt + max_retries retries
+        for attempt in range(self.max_retries + 1):
+            try:
+                async with semaphore:
+                    await self._wait_for_request_slot()
                     return await exchange.fetch_ohlcv(**kwargs)
-                except RETRYABLE_EXCEPTIONS as e:
-                    last_exception = e
-                    # Skip sleeping on last attempt (no more retries after this)
-                    if attempt < self.max_retries:
-                        # Calculate exponential backoff: base * 2^attempt
-                        delay = self.rate_limit_backoff * (2**attempt)
-                        # Add jitter while preserving monotonic backoff growth.
-                        jitter = delay * (1.0 + (0.5 * random.random()))
-                        logger.warning(
-                            "Rate limit hit (attempt %d/%d): %s - %s. Retrying in %.2fs.",
-                            attempt + 1,
-                            self.max_retries + 1,
-                            type(e).__name__,
-                            e,
-                            jitter,
-                        )
-                        await asyncio.sleep(jitter)
-                except NON_RETRYABLE_EXCEPTIONS as e:
-                    # Permanent error - log and re-raise
-                    logger.warning(
-                        "Non-retryable exception: %s - %s", type(e).__name__, e
+            except RETRYABLE_EXCEPTIONS as e:
+                last_exception = e
+                # Skip sleeping on last attempt (no more retries after this)
+                if attempt < self.max_retries:
+                    # Calculate exponential backoff: base * 2^attempt
+                    delay = self.rate_limit_backoff * (2**attempt)
+                    # Add jitter while preserving monotonic backoff growth.
+                    jitter = delay * (1.0 + (0.5 * random.random()))
+                    log_retry = logger.warning if self.verbosity == Verbosity.VERBOSE else logger.info
+                    log_retry(
+                        "Rate limit hit (attempt %d/%d): %s - %s. Retrying in %.2fs.",
+                        attempt + 1,
+                        self.max_retries + 1,
+                        type(e).__name__,
+                        e,
+                        jitter,
                     )
-                    raise
+                    await asyncio.sleep(jitter)
+            except NON_RETRYABLE_EXCEPTIONS as e:
+                # Permanent error - log and re-raise
+                logger.warning(
+                    "Non-retryable exception: %s - %s", type(e).__name__, e
+                )
+                raise
 
-            # All retries exhausted
-            logger.error(
-                "Max retries (%d) exhausted for fetch_ohlcv. Last error: %s - %s",
-                self.max_retries,
-                type(last_exception).__name__,
-                last_exception,
-            )
-            # last_exception must be set since we only get here after catching RETRYABLE_EXCEPTIONS
-            raise last_exception  # type: ignore[arg-type]
+        # All retries exhausted
+        logger.error(
+            "Max retries (%d) exhausted for fetch_ohlcv. Last error: %s - %s",
+            self.max_retries,
+            type(last_exception).__name__,
+            last_exception,
+        )
+        # last_exception must be set since we only get here after catching RETRYABLE_EXCEPTIONS
+        raise last_exception  # type: ignore[arg-type]
 
     async def fetch(
         self,
