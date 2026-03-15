@@ -897,28 +897,47 @@ class CoinbaseDataClient:
             )
             return (symbol, timeframe, df)
 
-        # Create all tasks
+        # Create all tasks with their metadata (symbol, timeframe)
         tasks = []
+        task_metadata = []  # Track (symbol, timeframe) for each task
         for symbol, timeframe in combinations:
             task_id = task_ids.get((symbol, timeframe))
             tasks.append(fetch_one(symbol, timeframe, task_id))
+            task_metadata.append((symbol, timeframe))
 
-        # Run all concurrently
+        # Run all concurrently with return_exceptions to preserve partial results
+        # If any task fails, others continue and results are preserved
         try:
-            results = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             # Stop shared progress regardless of success or failure
             if shared_progress is not None:
                 shared_progress.stop()
 
-        # Build nested dict structure
+        # Build nested dict structure, handling exceptions from failed tasks
         result_dict: dict[str, dict[str, pl.DataFrame]] = {}
         total_candles = 0
-        for symbol, timeframe, df in results:
+        failed_tasks = []
+        for i, result in enumerate(results):
+            # Check if result is an exception (from return_exceptions=True)
+            # Note: Using BaseException to catch all throwables including KeyboardInterrupt
+            if isinstance(result, BaseException):
+                symbol, timeframe = task_metadata[i]
+                failed_tasks.append((symbol, timeframe, result))
+                continue
+
+            symbol, timeframe, df = result
             if symbol not in result_dict:
                 result_dict[symbol] = {}
             result_dict[symbol][timeframe] = df
             total_candles += len(df)
+
+        # Log failures for visibility
+        if failed_tasks:
+            for symbol, timeframe, exc in failed_tasks:
+                print(
+                    f"Warning: Failed to fetch {symbol}/{timeframe}: {type(exc).__name__}: {exc}"
+                )
 
         # Verbose mode: print batch completion message
         if effective_verbosity == Verbosity.VERBOSE:
