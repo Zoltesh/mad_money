@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import random
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -50,6 +51,9 @@ COINBASE_CANDLE_LIMIT = 300
 
 # Progress update interval: batch progress updates to reduce contention in concurrent operations
 PROGRESS_UPDATE_INTERVAL = 10
+
+# Safety guard for unbounded historical fetches with persistent failures when end_date is omitted
+MAX_CONSECUTIVE_RETRYABLE_FAILURES_NO_END_DATE = 5
 
 # Retryable exceptions that should trigger a retry attempt
 RETRYABLE_EXCEPTIONS = (
@@ -400,8 +404,8 @@ class CoinbaseDataClient:
                     if attempt < self.max_retries:
                         # Calculate exponential backoff: base * 2^attempt
                         delay = self.rate_limit_backoff * (2**attempt)
-                        # Add jitter: 0.5-1.5x multiplier to prevent thundering herd
-                        jitter = delay * (0.5 + random.random())
+                        # Add jitter while preserving monotonic backoff growth.
+                        jitter = delay * (1.0 + (0.5 * random.random()))
                         logger.warning(
                             "Rate limit hit (attempt %d/%d): %s - %s. Retrying in %.2fs.",
                             attempt + 1,
@@ -437,6 +441,9 @@ class CoinbaseDataClient:
         verbosity: Verbosity | None = None,
         progress_task_id: Any = None,
         shared_progress: Progress | None = None,
+        on_batch: Callable[[pl.DataFrame], Awaitable[None]] | None = None,
+        collect_results: bool = True,
+        continue_on_short_batch: bool = False,
     ) -> pl.DataFrame:
         """Fetch historical OHLCV data from Coinbase.
 
@@ -448,6 +455,10 @@ class CoinbaseDataClient:
             verbosity: Override verbosity level for this call.
             progress_task_id: Task ID from shared Rich Progress (for fetch_multiple).
             shared_progress: Shared Rich Progress instance (for fetch_multiple).
+            on_batch: Optional async callback executed for each fetched batch DataFrame.
+            collect_results: Whether to collect all rows in-memory and return full DataFrame.
+            continue_on_short_batch: If True, keep iterating when a returned batch has
+                fewer candles than the exchange limit.
 
         Returns:
             Polars DataFrame with OHLCV columns.
@@ -502,15 +513,63 @@ class CoinbaseDataClient:
                 )
 
         all_candles: list[list[float]] = []
+        timeframe_ms = TIMEFRAME_SECONDS[timeframe] * 1000
         since = start_ts
         pending_advance = 0  # For batching progress updates (TASK-008)
+        failed_batches = 0  # Track failed batches for reporting
+        consecutive_failed_batches = 0
+        total_candles_fetched = 0
 
         try:
             while since is not None:
+                # Exit if we've passed the end date
+                if end_ts and since > end_ts:
+                    break
+
                 # Fetch next batch with semaphore and rate limit handling
-                candles = await self._fetch_batch(
-                    exchange, semaphore, symbol, timeframe, int(since)
-                )
+                try:
+                    candles = await self._fetch_batch(
+                        exchange, semaphore, symbol, timeframe, int(since)
+                    )
+                except NON_RETRYABLE_EXCEPTIONS:
+                    # Non-retryable errors should halt the entire fetch
+                    raise
+                except RETRYABLE_EXCEPTIONS as e:
+                    # After exhausting retries, log and skip this batch
+                    logger.warning(
+                        "Batch failed after retries for %s %s (timestamp %d): %s - %s. Continuing with remaining batches.",
+                        symbol,
+                        timeframe,
+                        since,
+                        type(e).__name__,
+                        e,
+                    )
+                    failed_batches += 1
+                    consecutive_failed_batches += 1
+
+                    # For unbounded fetches, fail fast after repeated exhausted retries.
+                    # This prevents near-infinite runtime from old start dates when the API
+                    # is unavailable or rate-limiting persistently.
+                    if (
+                        end_date is None
+                        and consecutive_failed_batches
+                        >= MAX_CONSECUTIVE_RETRYABLE_FAILURES_NO_END_DATE
+                    ):
+                        raise
+
+                    # Skip forward by one full API batch window instead of one candle.
+                    # This guarantees forward progress and avoids very long loops.
+                    since = since + (timeframe_ms * COINBASE_CANDLE_LIMIT)
+                    pending_advance = self._update_progress(
+                        pending_advance,
+                        progress_task_id,
+                        shared_progress,
+                        progress_tracker,
+                        use_shared_progress,
+                        total_candles_fetched,
+                        expected_candles,
+                    )
+                    continue
 
                 # Handle empty result - exit cleanly
                 if not candles:
@@ -525,8 +584,20 @@ class CoinbaseDataClient:
                     break
 
                 # Process the batch
-                all_candles.extend(candles)
+                consecutive_failed_batches = 0
                 last_candle_ts = candles[-1][0]
+                batch_candles = candles
+
+                # Filter to end_date boundary before processing callback/collection
+                if end_ts is not None:
+                    batch_candles = [c for c in batch_candles if c[0] <= end_ts]
+
+                if batch_candles:
+                    total_candles_fetched += len(batch_candles)
+                    if collect_results:
+                        all_candles.extend(batch_candles)
+                    if on_batch is not None:
+                        await on_batch(self._candles_to_dataframe(batch_candles))
 
                 # Update progress tracking
                 pending_advance = self._update_progress(
@@ -535,23 +606,13 @@ class CoinbaseDataClient:
                     shared_progress,
                     progress_tracker,
                     use_shared_progress,
-                    len(all_candles),
+                    total_candles_fetched,
                     expected_candles,
                 )
 
-                # Check exit conditions and set next batch timestamp
-                # Check if we've reached the end date
-                if end_ts and last_candle_ts > end_ts:
-                    self._flush_progress(
-                        pending_advance,
-                        progress_task_id,
-                        shared_progress,
-                        progress_tracker,
-                        use_shared_progress,
-                    )
-                    since = None
-                # Check if we've reached the latest (no more data)
-                elif len(candles) < COINBASE_CANDLE_LIMIT:
+                # Check exit conditions and set next batch timestamp.
+                # When end_date is provided, we stop only after passing it.
+                if end_ts and last_candle_ts >= end_ts:
                     self._flush_progress(
                         pending_advance,
                         progress_task_id,
@@ -561,8 +622,52 @@ class CoinbaseDataClient:
                     )
                     since = None
                 else:
-                    # Continue to next batch using the timestamp of the last candle + 1ms
-                    since = last_candle_ts + 1
+                    # Always advance by full timeframe to avoid duplicate final candles.
+                    next_since = last_candle_ts + timeframe_ms
+
+                    # Monotonic guard: if exchange returns stale/overlapping data, still advance.
+                    if next_since <= since:
+                        next_since = since + timeframe_ms
+
+                    # By default (backward-compatible), short batches terminate fetch.
+                    # For sparse-history backfills, callers can opt in to continue.
+                    if not continue_on_short_batch and len(candles) < COINBASE_CANDLE_LIMIT:
+                        self._flush_progress(
+                            pending_advance,
+                            progress_task_id,
+                            shared_progress,
+                            progress_tracker,
+                            use_shared_progress,
+                        )
+                        since = None
+                    # With no explicit end_date, stop only when short batch is close to "now".
+                    # Small historical batches can happen due to missing candles and should not
+                    # terminate the fetch early.
+                    elif end_date is None and len(candles) < COINBASE_CANDLE_LIMIT:
+                        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+                        if last_candle_ts >= (now_ms - timeframe_ms):
+                            self._flush_progress(
+                                pending_advance,
+                                progress_task_id,
+                                shared_progress,
+                                progress_tracker,
+                                use_shared_progress,
+                            )
+                            since = None
+                        else:
+                            since = next_since
+                    else:
+                        since = next_since
+
+            # Log summary of batch results
+            if failed_batches > 0:
+                logger.warning(
+                    "Fetch completed for %s %s: %d candles fetched, %d batches failed",
+                    symbol,
+                    timeframe,
+                    len(all_candles),
+                    failed_batches,
+                )
         finally:
             # Always close progress tracker (only if we created our own)
             if progress_tracker is not None:
@@ -574,15 +679,11 @@ class CoinbaseDataClient:
                         f"Completed fetch for {symbol} {timeframe}: {len(all_candles)} candles fetched"
                     )
 
-        if not all_candles:
+        if not collect_results:
             return pl.DataFrame(schema=OHLCV_SCHEMA)
 
-        # Filter to end_date if specified
-        if end_date:
-            end_ts_filter = int(
-                self._parse_date(end_date, end_of_day=True).timestamp() * 1000
-            )
-            all_candles = [c for c in all_candles if c[0] <= end_ts_filter]
+        if not all_candles:
+            return pl.DataFrame(schema=OHLCV_SCHEMA)
 
         # Convert to Polars DataFrame
         return self._candles_to_dataframe(all_candles)
@@ -658,14 +759,30 @@ class CoinbaseDataClient:
             # Load existing data if file exists and append with deduplication
             if file_path.exists():
                 existing_df = pl.read_parquet(file_path)
+                existing_df = existing_df.filter(
+                    (pl.col("timestamp").dt.year() == int(year))
+                    & (pl.col("timestamp").dt.month() == int(month))
+                )
                 # Combine and remove duplicates based on timestamp
                 combined_df = pl.concat(
                     [existing_df, partition_df.drop(["year", "month"])]
                 )
-                combined_df = combined_df.unique(subset=["timestamp"], keep="first")
+                combined_df = combined_df.unique(subset=["timestamp"], keep="last")
+                combined_df = combined_df.sort("timestamp")
                 combined_df.write_parquet(file_path)
             else:
-                partition_df.drop(["year", "month"]).write_parquet(file_path)
+                partition_df.drop(["year", "month"]).sort("timestamp").write_parquet(
+                    file_path
+                )
+
+    async def save_async(
+        self,
+        df: pl.DataFrame,
+        symbol: str,
+        timeframe: str,
+    ) -> None:
+        """Asynchronously write a DataFrame to partitioned parquet files."""
+        await asyncio.to_thread(self.save, df, symbol, timeframe)
 
     async def fetch_latest(
         self,
@@ -714,7 +831,7 @@ class CoinbaseDataClient:
 
         return df
 
-    def update(self, symbol: str, timeframe: str) -> pl.DataFrame:
+    async def update_async(self, symbol: str, timeframe: str) -> pl.DataFrame:
         """Update stored OHLCV data with latest candles.
 
         Loads existing data, fetches the latest candles, combines them,
@@ -735,9 +852,9 @@ class CoinbaseDataClient:
             existing_df["timestamp"].to_list() if not existing_df.is_empty() else None
         )
 
-        # Fetch latest candles (run the async method)
-        latest_df = asyncio.run(
-            self.fetch_latest(symbol, timeframe, exclude_timestamps=exclude_timestamps)
+        # Fetch latest candles
+        latest_df = await self.fetch_latest(
+            symbol, timeframe, exclude_timestamps=exclude_timestamps
         )
 
         if existing_df.is_empty():
@@ -755,6 +872,17 @@ class CoinbaseDataClient:
             self.save(combined_df, symbol, timeframe)
 
         return combined_df
+
+    def update(self, symbol: str, timeframe: str) -> pl.DataFrame:
+        """Sync wrapper for update_async()."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.update_async(symbol, timeframe))
+        raise RuntimeError(
+            "update() cannot be called from an active event loop. "
+            "Use await update_async(...) instead."
+        )
 
     async def close(self) -> None:
         """Close the exchange connection."""
@@ -969,12 +1097,7 @@ class CoinbaseDataClient:
 
         # Run all concurrently with return_exceptions to preserve partial results
         # If any task fails, others continue and results are preserved
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        finally:
-            # Stop shared progress regardless of success or failure
-            if shared_progress is not None:
-                shared_progress.stop()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Build nested dict structure, handling exceptions from failed tasks
         result_dict: dict[str, dict[str, pl.DataFrame]] = {}
@@ -985,6 +1108,16 @@ class CoinbaseDataClient:
             # Note: Using BaseException to catch all throwables including KeyboardInterrupt
             if isinstance(result, BaseException):
                 symbol, timeframe = task_metadata[i]
+                task_id = task_ids.get((symbol, timeframe))
+                # Update progress bar to show failure
+                if shared_progress is not None and task_id is not None:
+                    # Mark as complete but with 0% to indicate failure
+                    shared_progress.update(task_id, completed=0)
+                    # Add error message to the task description
+                    shared_progress.update(
+                        task_id,
+                        description=f"[red]{symbol} {timeframe} (failed)[/red]",
+                    )
                 failed_tasks.append((symbol, timeframe, result))
                 continue
 
@@ -1005,4 +1138,48 @@ class CoinbaseDataClient:
         if effective_verbosity == Verbosity.VERBOSE:
             print(f"Completed batch fetch: {total_candles} total candles fetched")
 
+        if shared_progress is not None:
+            shared_progress.stop()
+
         return result_dict
+
+    async def fetch_and_save(
+        self,
+        symbol: str,
+        timeframe: str,
+        start_date: str,
+        end_date: str | None = None,
+        verbosity: Verbosity | None = None,
+    ) -> None:
+        """Fetch OHLCV data and stream-write each batch to parquet asynchronously."""
+
+        async def _write_batch(batch_df: pl.DataFrame) -> None:
+            if not batch_df.is_empty():
+                await self.save_async(batch_df, symbol, timeframe)
+
+        await self.fetch(
+            symbol=symbol,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            verbosity=verbosity,
+            on_batch=_write_batch,
+            collect_results=False,
+            continue_on_short_batch=True,
+        )
+
+    async def fetch_multiple_and_save(
+        self,
+        symbols: list[str],
+        timeframes: list[str],
+        start_date: str,
+        end_date: str | None = None,
+        verbosity: Verbosity | None = None,
+    ) -> None:
+        """Fetch and persist multiple symbol/timeframe combinations concurrently."""
+        tasks = [
+            self.fetch_and_save(symbol, timeframe, start_date, end_date, verbosity)
+            for symbol in symbols
+            for timeframe in timeframes
+        ]
+        await asyncio.gather(*tasks)

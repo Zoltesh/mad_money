@@ -9,7 +9,7 @@ from src.data.ohlcv import CoinbaseDataClient
 async def main():
     """Fetch OHLCV data for multiple symbols and timeframes."""
     async with CoinbaseDataClient(verbosity=Verbosity.PROGRESS) as client:
-        results = await client.fetch_multiple(
+        await client.fetch_multiple_and_save(
             symbols=[
                 "AVAX/USDC",
                 "ADA/USDC",
@@ -36,10 +36,6 @@ async def main():
             start_date="2025-01-01",
             end_date="2025-01-07",
         )
-
-        for symbol, timeframes in results.items():
-            for timeframe, df in timeframes.items():
-                client.save(df, symbol, timeframe)
 
 
 if __name__ == "__main__":
