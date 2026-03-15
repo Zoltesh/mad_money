@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import random
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -91,6 +92,7 @@ class CoinbaseDataClient:
         data_dir: str = "./data",
         max_concurrency: int = 10,
         rate_limit_backoff: float = 1.0,
+        max_retries: int = 3,
         api_key: str | None = None,
         private_key: str | None = None,
         verbosity: Verbosity | None = None,
@@ -100,7 +102,8 @@ class CoinbaseDataClient:
         Args:
             data_dir: Directory for storing fetched data.
             max_concurrency: Maximum number of concurrent requests.
-            rate_limit_backoff: Backoff time in seconds for rate limiting.
+            rate_limit_backoff: Initial backoff time in seconds for rate limiting.
+            max_retries: Maximum number of retry attempts with exponential backoff.
             api_key: Optional Coinbase API key for authenticated requests.
             private_key: Optional Coinbase private key (PEM format) for authenticated requests.
             verbosity: Verbosity level for output control. If None, auto-detects test environment.
@@ -108,6 +111,7 @@ class CoinbaseDataClient:
         self.data_dir = data_dir
         self.max_concurrency = max_concurrency
         self.rate_limit_backoff = rate_limit_backoff
+        self.max_retries = max_retries
         self._api_key = api_key
         self._private_key = private_key
 
@@ -370,7 +374,7 @@ class CoinbaseDataClient:
         semaphore: asyncio.Semaphore,
         **kwargs: Any,
     ) -> Any:
-        """Fetch OHLCV data with rate-limit retry handling.
+        """Fetch OHLCV data with exponential backoff retry handling.
 
         Args:
             exchange: The ccxt exchange instance.
@@ -379,18 +383,50 @@ class CoinbaseDataClient:
 
         Returns:
             List of candles from fetch_ohlcv.
+
+        Raises:
+            The last encountered exception after max_retries exhausted.
         """
         async with semaphore:
-            try:
-                return await exchange.fetch_ohlcv(**kwargs)
-            except RETRYABLE_EXCEPTIONS:
-                # Transient error - retry once after backoff
-                await asyncio.sleep(self.rate_limit_backoff)
-                return await exchange.fetch_ohlcv(**kwargs)
-            except NON_RETRYABLE_EXCEPTIONS as e:
-                # Permanent error - log and re-raise
-                logger.warning("Non-retryable exception: %s - %s", type(e).__name__, e)
-                raise
+            last_exception: Exception | None = None
+
+            # Loop through initial attempt + max_retries retries
+            for attempt in range(self.max_retries + 1):
+                try:
+                    return await exchange.fetch_ohlcv(**kwargs)
+                except RETRYABLE_EXCEPTIONS as e:
+                    last_exception = e
+                    # Skip sleeping on last attempt (no more retries after this)
+                    if attempt < self.max_retries:
+                        # Calculate exponential backoff: base * 2^attempt
+                        delay = self.rate_limit_backoff * (2**attempt)
+                        # Add jitter: 0.5-1.5x multiplier to prevent thundering herd
+                        jitter = delay * (0.5 + random.random())
+                        logger.warning(
+                            "Rate limit hit (attempt %d/%d): %s - %s. Retrying in %.2fs.",
+                            attempt + 1,
+                            self.max_retries + 1,
+                            type(e).__name__,
+                            e,
+                            jitter,
+                        )
+                        await asyncio.sleep(jitter)
+                except NON_RETRYABLE_EXCEPTIONS as e:
+                    # Permanent error - log and re-raise
+                    logger.warning(
+                        "Non-retryable exception: %s - %s", type(e).__name__, e
+                    )
+                    raise
+
+            # All retries exhausted
+            logger.error(
+                "Max retries (%d) exhausted for fetch_ohlcv. Last error: %s - %s",
+                self.max_retries,
+                type(last_exception).__name__,
+                last_exception,
+            )
+            # last_exception must be set since we only get here after catching RETRYABLE_EXCEPTIONS
+            raise last_exception  # type: ignore[arg-type]
 
     async def fetch(
         self,

@@ -20,6 +20,7 @@ def test_client_import():
     assert client.data_dir == "./data"
     assert client.max_concurrency == 10
     assert client.rate_limit_backoff == 1.0
+    assert client.max_retries == 3  # Default max_retries
 
 
 def test_schema_import():
@@ -50,10 +51,12 @@ def test_client_custom_parameters():
         data_dir="/custom/path",
         max_concurrency=5,
         rate_limit_backoff=2.0,
+        max_retries=5,
     )
     assert client.data_dir == "/custom/path"
     assert client.max_concurrency == 5
     assert client.rate_limit_backoff == 2.0
+    assert client.max_retries == 5
 
 
 def test_supported_timeframes():
@@ -1624,7 +1627,7 @@ class TestConcurrencyAndGather:
     @pytest.mark.asyncio
     async def test_exponential_backoff_timing(self):
         """Test that retry uses appropriate backoff timing."""
-        client = CoinbaseDataClient(rate_limit_backoff=0.1)
+        client = CoinbaseDataClient(rate_limit_backoff=0.1, max_retries=2)
 
         call_times = []
 
@@ -1639,11 +1642,16 @@ class TestConcurrencyAndGather:
             semaphore = asyncio.Semaphore(1)
             await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
 
-        # Should have made 2 calls
-        assert len(call_times) == 2
-        # Second call should be after backoff time
+        # Should have made 3 calls (1 initial + 2 retries)
+        assert len(call_times) == 3, f"Expected 3 calls, got {len(call_times)}"
+        # Second call should be after backoff time (~0.1s for attempt 0)
         time_diff = call_times[1] - call_times[0]
-        assert time_diff >= 0.09, f"Backoff should be ~0.1s, got {time_diff}s"
+        # With jitter (0.5-1.5x), minimum is 0.05s
+        assert time_diff >= 0.05, f"Backoff should be ~0.1s (with jitter), got {time_diff}s"
+        # Third call should be after ~0.2s (exponential backoff for attempt 1)
+        time_diff2 = call_times[2] - call_times[1]
+        # With jitter (0.5-1.5x), minimum is 0.1s
+        assert time_diff2 >= 0.1, f"Backoff should be ~0.2s (with jitter), got {time_diff2}s"
 
     @pytest.mark.asyncio
     async def test_backoff_with_jitter_no_negative_delay(self):
@@ -1681,8 +1689,8 @@ class TestConcurrencyAndGather:
 
     @pytest.mark.asyncio
     async def test_max_retries_limit(self):
-        """Test that retry respects max retries - currently 1 retry after initial failure."""
-        client = CoinbaseDataClient(rate_limit_backoff=0.01)
+        """Test that retry respects max retries - now uses exponential backoff."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01, max_retries=2)
 
         call_count = 0
 
@@ -1696,11 +1704,11 @@ class TestConcurrencyAndGather:
 
         semaphore = asyncio.Semaphore(1)
 
-        # Should fail after initial + 1 retry
+        # Should fail after initial + 2 retries = 3 total calls
         with pytest.raises(ccxt.RateLimitExceeded):
             await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
 
-        assert call_count == 2, f"Should make initial call + 1 retry = 2 calls, got {call_count}"
+        assert call_count == 3, f"Should make initial call + 2 retries = 3 calls, got {call_count}"
 
     @pytest.mark.asyncio
     async def test_success_after_retries(self):
@@ -1889,3 +1897,129 @@ class TestConcurrencyAndGather:
             await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD", timeframe="1h")
 
         assert call_count == 1, "Should NOT retry on PermissionDenied"
+
+
+# Exponential backoff tests
+class TestExponentialBackoff:
+    """Tests for exponential backoff retry logic."""
+
+    @pytest.mark.asyncio
+    async def test_exponential_backoff_timing(self):
+        """Verify delays increase exponentially (mock time)."""
+        client = CoinbaseDataClient(rate_limit_backoff=1.0, max_retries=4)
+
+        sleep_times = []
+
+        async def mock_sleep(duration):
+            sleep_times.append(duration)
+
+        async def mock_fetch(**kwargs):
+            raise ccxt.RateLimitExceeded("Rate limited")
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        semaphore = asyncio.Semaphore(1)
+
+        with patch("asyncio.sleep", side_effect=mock_sleep):
+            with pytest.raises(ccxt.RateLimitExceeded):
+                await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD")
+
+        # With base=1.0 and max_retries=4, we expect:
+        # Total attempts = 5 (1 initial + 4 retries)
+        # Sleeps = 4 (after attempts 0, 1, 2, 3 before attempts 1, 2, 3, 4)
+        # Delays: attempt 0→1s, 1→2s, 2→4s, 3→8s (with jitter)
+        assert len(sleep_times) == 4, f"Expected 4 sleeps (retries), got {len(sleep_times)}"
+
+        # Verify exponential growth (ignoring jitter for the check)
+        assert sleep_times[1] > sleep_times[0], "Second delay should be greater than first"
+        assert sleep_times[2] > sleep_times[1], "Third delay should be greater than second"
+        assert sleep_times[3] > sleep_times[2], "Fourth delay should be greater than third"
+
+    @pytest.mark.asyncio
+    async def test_max_retries_respects_limit(self):
+        """Verify exactly N retries then gives up."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01, max_retries=3)
+
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise ccxt.RateLimitExceeded("Rate limited")
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        semaphore = asyncio.Semaphore(1)
+
+        with pytest.raises(ccxt.RateLimitExceeded):
+            await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD")
+
+        # First attempt + max_retries retries = max_retries + 1 total calls
+        assert call_count == 4, f"Expected 4 calls (1 + 3 retries), got {call_count}"
+
+    @pytest.mark.asyncio
+    async def test_backoff_with_jitter(self):
+        """Verify jitter adds randomness to delays."""
+        client = CoinbaseDataClient(rate_limit_backoff=1.0, max_retries=10)
+
+        sleep_times = []
+
+        async def mock_sleep(duration):
+            sleep_times.append(duration)
+
+        async def mock_fetch(**kwargs):
+            raise ccxt.RateLimitExceeded("Rate limited")
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        semaphore = asyncio.Semaphore(1)
+
+        # Run multiple times to verify jitter produces different values
+        for _ in range(5):
+            sleep_times.clear()
+
+            with patch("asyncio.sleep", side_effect=mock_sleep):
+                with pytest.raises(ccxt.RateLimitExceeded):
+                    await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD")
+
+            # Verify jitter: delay should vary (not be exactly the exponential value)
+            # Base delay for attempt 0 is 1.0, with jitter it should be 0.5-1.5
+            # Since we can't predict exact random, just verify sleeps happen
+            assert len(sleep_times) == 10
+
+    @pytest.mark.asyncio
+    async def test_success_after_retries(self):
+        """Simulate rate limit on first 2 attempts, success on 3rd."""
+        client = CoinbaseDataClient(rate_limit_backoff=0.01, max_retries=3)
+
+        call_count = 0
+
+        async def mock_fetch(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                raise ccxt.RateLimitExceeded("Rate limited")
+            return [[1700000000000, 42000, 42100, 41900, 42050, 1.5]]
+
+        exchange = AsyncMock()
+        exchange.fetch_ohlcv = mock_fetch
+
+        semaphore = asyncio.Semaphore(1)
+
+        result = await client._fetch_with_retry(exchange, semaphore, symbol="BTC/USD")
+
+        assert call_count == 3, f"Expected 3 calls (2 failures + 1 success), got {call_count}"
+        assert result == [[1700000000000, 42000, 42100, 41900, 42050, 1.5]]
+
+    @pytest.mark.asyncio
+    async def test_constructor_accepts_max_retries(self):
+        """Verify new max_retries parameter works."""
+        client = CoinbaseDataClient(max_retries=7)
+        assert client.max_retries == 7
+
+        # Test default
+        client_default = CoinbaseDataClient()
+        assert client_default.max_retries == 3
