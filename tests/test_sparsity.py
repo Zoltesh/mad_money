@@ -166,3 +166,40 @@ def test_parquet_coverage_report_rounds_down(tmp_path: Path) -> None:
     )
     feb_row = report.filter(pl.col("month") == "feb").row(0, named=True)
     assert feb_row["ratio"] == 0.99
+
+
+def test_parquet_coverage_report_discovers_all(tmp_path: Path) -> None:
+    """Discover symbols/timeframes/years/months when omitted."""
+    base_path = tmp_path / "ohlcv"
+
+    valid_symbol = "eth-usdc"
+    invalid_symbol = "ethusdc"
+    timeframe = "1m"
+    year = "2026"
+
+    valid_path = base_path / valid_symbol / timeframe / year
+    invalid_path = base_path / invalid_symbol / timeframe / year
+    valid_path.mkdir(parents=True)
+    invalid_path.mkdir(parents=True)
+
+    data = pl.DataFrame(
+        {
+            "timestamp": ["2026-01-01T00:00:00Z"] * 3,
+            "open": [1.0] * 3,
+            "high": [1.0] * 3,
+            "low": [1.0] * 3,
+            "close": [1.0] * 3,
+            "volume": [1.0] * 3,
+        }
+    )
+    data.write_parquet(valid_path / "01.parquet")
+    data.write_parquet(invalid_path / "01.parquet")
+
+    report = parquet_coverage_report(base_path=base_path)
+
+    assert report.shape == (1, 7)
+    row = report.row(0, named=True)
+    assert row["symbol"] == valid_symbol
+    assert row["year"] == year
+    assert row["month"] == "jan"
+    assert row["timeframe"] == timeframe
