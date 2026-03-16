@@ -20,6 +20,7 @@ from src.data.progress import (
     ProgressTracker,
     RichProgressManager,
     _is_test_environment,
+    build_shared_progress,
     calculate_expected_batches,
     get_progress_color,
 )
@@ -839,6 +840,8 @@ class CoinbaseDataClient:
         start_date: str,
         end_date: str | None = None,
         verbosity: Verbosity | None = None,
+        progress_task_id: Any = None,
+        shared_progress: Progress | None = None,
     ) -> None:
         """Fetch OHLCV data and stream-write each batch to parquet asynchronously."""
 
@@ -852,6 +855,8 @@ class CoinbaseDataClient:
             start_date=start_date,
             end_date=end_date,
             verbosity=verbosity,
+            progress_task_id=progress_task_id,
+            shared_progress=shared_progress,
             on_batch=_write_batch,
             collect_results=False,
         )
@@ -865,14 +870,56 @@ class CoinbaseDataClient:
         verbosity: Verbosity | None = None,
     ) -> None:
         """Fetch and persist multiple symbol/timeframe combinations concurrently."""
-        tasks = [
-            self.fetch_and_save(symbol, timeframe, start_date, end_date, verbosity)
-            for symbol in symbols
-            for timeframe in timeframes
-        ]
-        task_metadata = [
-            (symbol, timeframe) for symbol in symbols for timeframe in timeframes
-        ]
+        effective_verbosity = self._resolve_verbosity(verbosity)
+        combinations = [(s, t) for s in symbols for t in timeframes]
+
+        if effective_verbosity == Verbosity.VERBOSE:
+            end_display = end_date if end_date else "latest"
+            print(
+                f"Starting batch fetch for {len(combinations)} symbol/timeframe combinations "
+                f"from {start_date} to {end_display}..."
+            )
+
+        shared_progress: Progress | None = None
+        task_ids: dict[tuple[str, str], Any] = {}
+        if effective_verbosity != Verbosity.DISABLED:
+            shared_progress = build_shared_progress(Progress)
+            shared_progress.start()
+
+            start_ts = int(self._parse_date(start_date).timestamp() * 1000)
+            if end_date:
+                end_ts = int(
+                    self._parse_date(end_date, end_of_day=True).timestamp() * 1000
+                )
+            else:
+                end_ts = int(datetime.now(UTC).timestamp() * 1000)
+
+            for symbol, timeframe in combinations:
+                color = get_progress_color(symbol, timeframe)
+                description = f"[{color}]{symbol} {timeframe}[/{color}]"
+                expected_batches = calculate_expected_batches(
+                    start_ts, end_ts, timeframe
+                )
+                task_id = shared_progress.add_task(description, total=expected_batches)
+                task_ids[(symbol, timeframe)] = task_id
+
+        tasks = []
+        task_metadata = []
+        for symbol, timeframe in combinations:
+            task_id = task_ids.get((symbol, timeframe))
+            tasks.append(
+                self.fetch_and_save(
+                    symbol,
+                    timeframe,
+                    start_date,
+                    end_date,
+                    effective_verbosity,
+                    progress_task_id=task_id,
+                    shared_progress=shared_progress,
+                )
+            )
+            task_metadata.append((symbol, timeframe))
+
         results = await self._gather_with_exceptions(tasks)
         failed_tasks = [
             (task_metadata[i], result)
@@ -881,6 +928,13 @@ class CoinbaseDataClient:
         ]
         if failed_tasks:
             for (symbol, timeframe), exc in failed_tasks:
+                task_id = task_ids.get((symbol, timeframe))
+                if shared_progress is not None and task_id is not None:
+                    shared_progress.update(task_id, completed=0)
+                    shared_progress.update(
+                        task_id,
+                        description=f"[red]{symbol} {timeframe} (failed)[/red]",
+                    )
                 logger.warning(
                     "Failed to fetch_and_save %s %s: %s: %s",
                     symbol,
@@ -888,3 +942,9 @@ class CoinbaseDataClient:
                     type(exc).__name__,
                     exc,
                 )
+
+        if effective_verbosity == Verbosity.VERBOSE:
+            print("Completed batch fetch and save")
+
+        if shared_progress is not None:
+            shared_progress.stop()

@@ -324,7 +324,14 @@ async def test_fetch_multiple_and_save_runs_all_combinations():
     client = CoinbaseDataClient()
     calls = []
 
-    async def mock_fetch_and_save(symbol, timeframe, start_date, end_date, verbosity):
+    async def mock_fetch_and_save(
+        symbol,
+        timeframe,
+        start_date,
+        end_date,
+        verbosity,
+        **_kwargs,
+    ):
         calls.append((symbol, timeframe, start_date, end_date))
 
     with patch.object(client, "fetch_and_save", side_effect=mock_fetch_and_save):
@@ -345,7 +352,14 @@ async def test_fetch_multiple_and_save_continues_when_one_combination_fails():
     client = CoinbaseDataClient()
     calls = []
 
-    async def mock_fetch_and_save(symbol, timeframe, start_date, end_date, verbosity):
+    async def mock_fetch_and_save(
+        symbol,
+        timeframe,
+        start_date,
+        end_date,
+        verbosity,
+        **_kwargs,
+    ):
         calls.append((symbol, timeframe))
         if symbol == "BTC/USD" and timeframe == "1h":
             raise ccxt.ExchangeError("coinbaseadvanced {\"error\":\"UNAVAILABLE\"}")

@@ -5,6 +5,61 @@ import asyncio
 from src.data import Verbosity
 from src.data.ohlcv import CoinbaseDataClient
 
+FAV_SYMBOLS = [
+                "AAVE/USDC",
+                "ADA/USDC",
+                "ALGO/USDC",
+                "APE/USDC",
+                "APT/USDC",
+                "ARB/USDC",
+                "ATOM/USDC",
+                "AVAX/USDC",
+                "BCH/USDC",
+                "BONK/USDC",
+                "BTC/USDC",
+                "CHZ/USDC",
+                "COMP/USDC",
+                "CRV/USDC",
+                "DOGE/USDC",
+                "DOT/USDC",
+                "EOS/USDC",
+                "ETH/USDC",
+                "FIL/USDC",
+                "GRT/USDC",
+                "ICP/USDC",
+                "INJ/USDC",
+                "LDO/USDC",
+                "LINK/USDC",
+                "LTC/USDC",
+                "MANA/USDC",
+                "MKR/USDC",
+                "NEAR/USDC",
+                "OP/USDC",
+                "QNT/USDC",
+                "RNDR/USDC",
+                "SAND/USDC",
+                "SHIB/USDC",
+                "SOL/USDC",
+                "SNX/USDC",
+                "TAO/USDC",
+                "UNI/USDC",
+                "XLM/USDC",
+                "XRP/USDC",
+                "XTZ/USDC",
+                "ZEC/USDC"
+]
+
+TIMEFRAMES = [
+    "1m",
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+    "2h",
+    "6h",
+    "1d"
+]
+
 
 async def main():
     """Fetch OHLCV data for multiple symbols and timeframes."""
@@ -17,31 +72,8 @@ async def main():
         enable_intra_combo_concurrency=True,
     ) as client:
         await client.fetch_multiple_and_save(
-            symbols=[
-                # "AVAX/USDC",
-                # "ADA/USDC",
-                "XLM/USDC",
-                "TAO/USDC",
-                "ZEC/USDC"
-                # "BTC/USDC",
-                # "ETH/USDC",
-                # "DOGE/USDC",
-                # "LINK/USDC",
-                # "LTC/USDC",
-                # "SHIB/USDC",
-                # "SOL/USDC",
-                # "XRP/USDC"
-                ],
-            timeframes=[
-                "1m"
-                # "5m",
-                # "15m",
-                # "30m",
-                # "1h",
-                # "2h",
-                # "6h",
-                # "1d",
-            ],  # Multiple timeframes
+            symbols= FAV_SYMBOLS,
+            timeframes= ["1d"],
             start_date="2026-01-01",
             end_date="2026-02-28",
         )
