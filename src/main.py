@@ -18,27 +18,29 @@ async def main():
     ) as client:
         await client.fetch_multiple_and_save(
             symbols=[
-                "AVAX/USDC",
-                "ADA/USDC",
-                "BCH/USDC",
-                "BTC/USDC",
-                "ETH/USDC",
-                "DOGE/USDC",
-                "LINK/USDC",
-                "LTC/USDC",
-                "SHIB/USDC",
-                "SOL/USDC",
-                "XRP/USDC"
+                # "AVAX/USDC",
+                # "ADA/USDC",
+                "XLM/USDC",
+                "TAO/USDC",
+                "ZEC/USDC"
+                # "BTC/USDC",
+                # "ETH/USDC",
+                # "DOGE/USDC",
+                # "LINK/USDC",
+                # "LTC/USDC",
+                # "SHIB/USDC",
+                # "SOL/USDC",
+                # "XRP/USDC"
                 ],
             timeframes=[
-                "1m",
-                "5m",
-                "15m",
-                "30m",
-                "1h",
-                "2h",
-                "6h",
-                "1d",
+                "1m"
+                # "5m",
+                # "15m",
+                # "30m",
+                # "1h",
+                # "2h",
+                # "6h",
+                # "1d",
             ],  # Multiple timeframes
             start_date="2026-01-01",
             end_date="2026-02-28",
