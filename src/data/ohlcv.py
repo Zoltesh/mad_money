@@ -100,6 +100,9 @@ class CoinbaseDataClient:
         min_request_interval: float = 0.06,
         rate_limit_backoff: float = 1.0,
         max_retries: int = 3,
+        batch_concurrency: int = 1,
+        batch_queue_size: int | None = None,
+        enable_intra_combo_concurrency: bool = True,
         api_key: str | None = None,
         private_key: str | None = None,
         verbosity: Verbosity | None = None,
@@ -113,6 +116,12 @@ class CoinbaseDataClient:
                 workers. Adds gentle global pacing to reduce 429 rate limits.
             rate_limit_backoff: Initial backoff time in seconds for rate limiting.
             max_retries: Maximum number of retry attempts with exponential backoff.
+            batch_concurrency: Concurrent batch fetches per symbol/timeframe combo
+                for bounded historical ranges.
+            batch_queue_size: Max in-flight batch write tasks per combo. Defaults to
+                max(2, batch_concurrency * 2) when not provided.
+            enable_intra_combo_concurrency: Enable concurrent bounded batch fetching
+                within a single symbol/timeframe combo.
             api_key: Optional Coinbase API key for authenticated requests.
             private_key: Optional Coinbase private key (PEM format) for authenticated requests.
             verbosity: Verbosity level for output control. If None, auto-detects test environment.
@@ -122,6 +131,14 @@ class CoinbaseDataClient:
         self.min_request_interval = min_request_interval
         self.rate_limit_backoff = rate_limit_backoff
         self.max_retries = max_retries
+        self.batch_concurrency = max(1, batch_concurrency)
+        default_batch_queue_size = max(2, self.batch_concurrency * 2)
+        self.batch_queue_size = (
+            default_batch_queue_size
+            if batch_queue_size is None
+            else max(1, batch_queue_size)
+        )
+        self.enable_intra_combo_concurrency = enable_intra_combo_concurrency
         self._api_key = api_key
         self._private_key = private_key
 
@@ -139,6 +156,8 @@ class CoinbaseDataClient:
         self._exchange: ccxt.async_support.coinbaseadvanced | None = None
         self._semaphore: asyncio.Semaphore | None = None
         self._request_gate: asyncio.Lock | None = None
+        self._save_locks: dict[str, asyncio.Lock] = {}
+        self._save_locks_guard = asyncio.Lock()
         self._next_request_at: float = 0.0
 
     @classmethod
@@ -603,8 +622,24 @@ class CoinbaseDataClient:
         symbol: str,
         timeframe: str,
     ) -> None:
-        """Asynchronously write a DataFrame to partitioned parquet files."""
-        await asyncio.to_thread(self.save, df, symbol, timeframe)
+        """Asynchronously write a DataFrame to partitioned parquet files.
+
+        Saves for the same symbol/timeframe are serialized to avoid overlapping
+        read-modify-write cycles to the same parquet partitions.
+        """
+        lock = await self._get_save_lock(symbol, timeframe)
+        async with lock:
+            await asyncio.to_thread(self.save, df, symbol, timeframe)
+
+    async def _get_save_lock(self, symbol: str, timeframe: str) -> asyncio.Lock:
+        """Return a stable async lock for a symbol/timeframe save stream."""
+        key = f"{self._symbol_to_path(symbol)}|{timeframe}"
+        async with self._save_locks_guard:
+            lock = self._save_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._save_locks[key] = lock
+            return lock
 
     async def fetch_latest(
         self,

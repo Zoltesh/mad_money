@@ -360,3 +360,123 @@ async def test_fetch_multiple_and_save_continues_when_one_combination_fails():
 
     assert len(calls) == 4
     assert ("ETH/USD", "1h") in calls
+
+
+@pytest.mark.asyncio
+async def test_fetch_single_combo_uses_concurrent_bounded_batches():
+    """Bounded single-combo fetch should run multiple batch windows concurrently."""
+    client = CoinbaseDataClient(
+        batch_concurrency=3,
+        batch_queue_size=6,
+        min_request_interval=0.0,
+    )
+    active_fetches = 0
+    max_active_fetches = 0
+    called_since: list[int] = []
+
+    async def mock_fetch_batch(_exchange, _semaphore, _symbol, _timeframe, since):
+        nonlocal active_fetches, max_active_fetches
+        called_since.append(since)
+        active_fetches += 1
+        max_active_fetches = max(max_active_fetches, active_fetches)
+        await asyncio.sleep(0.02)
+        active_fetches -= 1
+        return [
+            [since + (i * 60_000), 1.0, 1.0, 1.0, 1.0, 1.0] for i in range(300)
+        ]
+
+    expected_start = int(datetime(2024, 1, 1, 0, 0, tzinfo=UTC).timestamp() * 1000)
+    batch_span_ms = 300 * 60 * 1000  # 300 candles x 1m timeframe
+    expected_windows = [
+        expected_start,
+        expected_start + batch_span_ms,
+        expected_start + (2 * batch_span_ms),
+    ]
+
+    with patch.object(client, "_get_exchange", return_value=object()):
+        with patch.object(client, "_fetch_batch", side_effect=mock_fetch_batch):
+            result = await client.fetch(
+                symbol="BTC/USD",
+                timeframe="1m",
+                start_date="2024-01-01 00:00:00",
+                end_date="2024-01-01 12:00:00",
+            )
+
+    assert max_active_fetches > 1
+    assert sorted(called_since) == expected_windows
+    assert len(result) == 721
+
+
+@pytest.mark.asyncio
+async def test_fetch_unbounded_stays_sequential_despite_batch_concurrency():
+    """Unbounded fetch should keep legacy sequential progression behavior."""
+    client = CoinbaseDataClient(
+        batch_concurrency=4,
+        batch_queue_size=8,
+        min_request_interval=0.0,
+    )
+    active_fetches = 0
+    max_active_fetches = 0
+    call_count = 0
+    called_since: list[int] = []
+
+    async def mock_fetch_batch(_exchange, _semaphore, _symbol, _timeframe, since):
+        nonlocal active_fetches, max_active_fetches, call_count
+        called_since.append(since)
+        active_fetches += 1
+        max_active_fetches = max(max_active_fetches, active_fetches)
+        await asyncio.sleep(0.01)
+        active_fetches -= 1
+        call_count += 1
+        if call_count >= 3:
+            return []
+        return [[since, 1.0, 1.0, 1.0, 1.0, 1.0]]
+
+    with patch.object(client, "_get_exchange", return_value=object()):
+        with patch.object(client, "_fetch_batch", side_effect=mock_fetch_batch):
+            result = await client.fetch(
+                symbol="BTC/USD",
+                timeframe="1m",
+                start_date="2024-01-01",
+                end_date=None,
+            )
+
+    assert max_active_fetches == 1
+    assert len(called_since) == 3
+    assert called_since[1] > called_since[0]
+    assert called_since[2] > called_since[1]
+    assert len(result) == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_concurrent_bounded_handles_sparse_short_batches():
+    """Concurrent bounded mode should still advance through sparse short batches."""
+    client = CoinbaseDataClient(
+        batch_concurrency=3,
+        min_request_interval=0.0,
+    )
+    start_ts = int(datetime(2024, 1, 1, 0, 0, tzinfo=UTC).timestamp() * 1000)
+    end_ts = int(datetime(2024, 1, 1, 0, 3, tzinfo=UTC).timestamp() * 1000)
+    call_since_values = []
+
+    async def mock_fetch(*args, **kwargs):
+        since = kwargs["since"]
+        call_since_values.append(since)
+        if since > end_ts:
+            return []
+        return [[since, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0]]
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch
+        mock_exchange.return_value = mock_exchange_instance
+        result = await client.fetch(
+            "BTC/USD",
+            "1m",
+            "2024-01-01",
+            end_date="2024-01-01 00:03:00",
+        )
+
+    assert len(result) == 4
+    assert min(call_since_values) == start_ts
+    assert end_ts in call_since_values

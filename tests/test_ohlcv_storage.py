@@ -1,5 +1,8 @@
 """Lean storage tests for OHLCV parquet persistence and update flow."""
 
+import asyncio
+import threading
+import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -125,3 +128,31 @@ def test_load_validates_month_requires_year(tmp_path):
     client = CoinbaseDataClient(data_dir=str(tmp_path))
     with pytest.raises(ValueError, match="year must be specified"):
         client.load("BTC/USD", "1h", month=1)
+
+
+@pytest.mark.asyncio
+async def test_save_async_serializes_same_combo_writes(tmp_path, sample_df_factory):
+    """save_async should serialize concurrent writes for same symbol/timeframe."""
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+    df = sample_df_factory(datetime(2025, 1, 1, 0, 0, tzinfo=UTC))
+    active_saves = 0
+    max_active_saves = 0
+    counter_lock = threading.Lock()
+
+    def mock_save(_df, _symbol, _timeframe):
+        nonlocal active_saves, max_active_saves
+        with counter_lock:
+            active_saves += 1
+            max_active_saves = max(max_active_saves, active_saves)
+        time.sleep(0.03)
+        with counter_lock:
+            active_saves -= 1
+
+    with patch.object(client, "save", side_effect=mock_save):
+        await asyncio.gather(
+            client.save_async(df, "BTC/USD", "1h"),
+            client.save_async(df, "BTC/USD", "1h"),
+            client.save_async(df, "BTC/USD", "1h"),
+        )
+
+    assert max_active_saves == 1
