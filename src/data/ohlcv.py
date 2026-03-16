@@ -456,6 +456,24 @@ class CoinbaseDataClient:
                         jitter,
                     )
                     await asyncio.sleep(jitter)
+            except ccxt.ExchangeError as e:
+                # Some Coinbase transient backend failures are raised as ExchangeError
+                # (for example payloads containing "UNAVAILABLE"), so retry those.
+                if not self._is_retryable_exchange_error(e):
+                    raise
+                last_exception = e
+                if attempt < self.max_retries:
+                    delay = self.rate_limit_backoff * (2**attempt)
+                    jitter = delay * (1.0 + (0.5 * random.random()))
+                    log_retry = logger.warning if self.verbosity == Verbosity.VERBOSE else logger.info
+                    log_retry(
+                        "Retryable exchange error (attempt %d/%d): %s. Retrying in %.2fs.",
+                        attempt + 1,
+                        self.max_retries + 1,
+                        e,
+                        jitter,
+                    )
+                    await asyncio.sleep(jitter)
             except NON_RETRYABLE_EXCEPTIONS as e:
                 # Permanent error - log and re-raise
                 logger.warning(
@@ -472,6 +490,22 @@ class CoinbaseDataClient:
         )
         # last_exception must be set since we only get here after catching RETRYABLE_EXCEPTIONS
         raise last_exception  # type: ignore[arg-type]
+
+    @staticmethod
+    def _is_retryable_exchange_error(error: ccxt.ExchangeError) -> bool:
+        """Return True when an ExchangeError looks transient/retryable."""
+        message = str(error).upper()
+        retryable_markers = (
+            "UNAVAILABLE",
+            "SOMETHING WENT WRONG",
+            "INTERNAL SERVER ERROR",
+            "SERVICE UNAVAILABLE",
+            "TIMEOUT",
+            "TOO MANY REQUESTS",
+            "429",
+            "5XX",
+        )
+        return any(marker in message for marker in retryable_markers)
 
     async def fetch(
         self,
@@ -801,4 +835,21 @@ class CoinbaseDataClient:
             for symbol in symbols
             for timeframe in timeframes
         ]
-        await asyncio.gather(*tasks)
+        task_metadata = [
+            (symbol, timeframe) for symbol in symbols for timeframe in timeframes
+        ]
+        results = await self._gather_with_exceptions(tasks)
+        failed_tasks = [
+            (task_metadata[i], result)
+            for i, result in enumerate(results)
+            if isinstance(result, BaseException)
+        ]
+        if failed_tasks:
+            for (symbol, timeframe), exc in failed_tasks:
+                logger.warning(
+                    "Failed to fetch_and_save %s %s: %s: %s",
+                    symbol,
+                    timeframe,
+                    type(exc).__name__,
+                    exc,
+                )

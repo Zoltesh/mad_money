@@ -82,6 +82,32 @@ async def test_fetch_retries_on_rate_limit_then_succeeds():
 
 
 @pytest.mark.asyncio
+async def test_fetch_retries_on_retryable_exchange_error_then_succeeds():
+    """Transient ExchangeError payloads should be retried."""
+    client = CoinbaseDataClient(rate_limit_backoff=0.01)
+    call_count = 0
+    candles = [[1704067200000, 42000.0, 42100.0, 41900.0, 42050.0, 1000.0]]
+
+    async def mock_fetch(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ccxt.ExchangeError(
+                'coinbaseadvanced {"error":"UNAVAILABLE","message":"Something went wrong"}'
+            )
+        return candles
+
+    with patch.object(client, "_get_exchange") as mock_exchange:
+        mock_exchange_instance = AsyncMock()
+        mock_exchange_instance.fetch_ohlcv = mock_fetch
+        mock_exchange.return_value = mock_exchange_instance
+        result = await client.fetch("BTC/USD", "1m", "2024-01-01", "2024-01-01 00:00:00")
+
+    assert call_count >= 2
+    assert len(result) == 1
+
+
+@pytest.mark.asyncio
 async def test_fetch_retry_releases_semaphore_during_backoff():
     """A retrying request should not hold the semaphore while sleeping."""
     client = CoinbaseDataClient(
@@ -311,3 +337,26 @@ async def test_fetch_multiple_and_save_runs_all_combinations():
 
     assert len(calls) == 4
     assert ("BTC/USD", "1h", "2025-01-01", "2025-01-02") in calls
+
+
+@pytest.mark.asyncio
+async def test_fetch_multiple_and_save_continues_when_one_combination_fails():
+    """fetch_multiple_and_save should not abort on a single combination failure."""
+    client = CoinbaseDataClient()
+    calls = []
+
+    async def mock_fetch_and_save(symbol, timeframe, start_date, end_date, verbosity):
+        calls.append((symbol, timeframe))
+        if symbol == "BTC/USD" and timeframe == "1h":
+            raise ccxt.ExchangeError("coinbaseadvanced {\"error\":\"UNAVAILABLE\"}")
+
+    with patch.object(client, "fetch_and_save", side_effect=mock_fetch_and_save):
+        await client.fetch_multiple_and_save(
+            symbols=["BTC/USD", "ETH/USD"],
+            timeframes=["1h", "1d"],
+            start_date="2025-01-01",
+            end_date="2025-01-02",
+        )
+
+    assert len(calls) == 4
+    assert ("ETH/USD", "1h") in calls

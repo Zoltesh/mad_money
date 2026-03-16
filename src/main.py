@@ -33,8 +33,8 @@ async def main():
                 "6h",
                 "1d",
             ],  # Multiple timeframes
-            start_date="2025-01-01",
-            end_date="2025-01-07",
+            start_date="2023-01-01",
+            end_date="2026-02-28",
         )
 
 
