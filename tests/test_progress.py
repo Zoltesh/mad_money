@@ -259,6 +259,7 @@ class TestTestEnvironmentDetection:
         import importlib
 
         import src.data.progress as progress_module
+
         importlib.reload(progress_module)
         assert progress_module._is_test_environment() is True
 

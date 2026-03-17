@@ -75,7 +75,9 @@ async def test_fetch_retries_on_rate_limit_then_succeeds():
         mock_exchange_instance = AsyncMock()
         mock_exchange_instance.fetch_ohlcv = mock_fetch
         mock_exchange.return_value = mock_exchange_instance
-        result = await client.fetch("BTC/USD", "1m", "2024-01-01", "2024-01-01 00:00:00")
+        result = await client.fetch(
+            "BTC/USD", "1m", "2024-01-01", "2024-01-01 00:00:00"
+        )
 
     assert call_count >= 2
     assert len(result) == 1
@@ -101,7 +103,9 @@ async def test_fetch_retries_on_retryable_exchange_error_then_succeeds():
         mock_exchange_instance = AsyncMock()
         mock_exchange_instance.fetch_ohlcv = mock_fetch
         mock_exchange.return_value = mock_exchange_instance
-        result = await client.fetch("BTC/USD", "1m", "2024-01-01", "2024-01-01 00:00:00")
+        result = await client.fetch(
+            "BTC/USD", "1m", "2024-01-01", "2024-01-01 00:00:00"
+        )
 
     assert call_count >= 2
     assert len(result) == 1
@@ -198,7 +202,9 @@ async def test_fetch_includes_exact_end_timestamp():
         mock_exchange_instance = AsyncMock()
         mock_exchange_instance.fetch_ohlcv = mock_fetch
         mock_exchange.return_value = mock_exchange_instance
-        result = await client.fetch("BTC/USD", "1m", "2024-01-01", "2024-01-01 00:01:00")
+        result = await client.fetch(
+            "BTC/USD", "1m", "2024-01-01", "2024-01-01 00:01:00"
+        )
 
     timestamps = result["timestamp"].to_list()
     assert datetime(2024, 1, 1, 0, 1, tzinfo=UTC) in timestamps
@@ -296,6 +302,7 @@ async def test_fetch_and_save_streams_batches(tmp_path):
 
     with patch.object(client, "save_async", side_effect=mock_save_async):
         with patch.object(client, "fetch") as mock_fetch:
+
             async def run_fetch(**kwargs):
                 on_batch = kwargs["on_batch"]
                 await on_batch(
@@ -394,7 +401,7 @@ async def test_fetch_multiple_and_save_continues_when_one_combination_fails():
     ):
         calls.append((symbol, timeframe))
         if symbol == "BTC/USD" and timeframe == "1h":
-            raise ccxt.ExchangeError("coinbaseadvanced {\"error\":\"UNAVAILABLE\"}")
+            raise ccxt.ExchangeError('coinbaseadvanced {"error":"UNAVAILABLE"}')
 
     with patch.object(client, "fetch_and_save", side_effect=mock_fetch_and_save):
         await client.fetch_multiple_and_save(
@@ -427,9 +434,7 @@ async def test_fetch_single_combo_uses_concurrent_bounded_batches():
         max_active_fetches = max(max_active_fetches, active_fetches)
         await asyncio.sleep(0.02)
         active_fetches -= 1
-        return [
-            [since + (i * 60_000), 1.0, 1.0, 1.0, 1.0, 1.0] for i in range(300)
-        ]
+        return [[since + (i * 60_000), 1.0, 1.0, 1.0, 1.0, 1.0] for i in range(300)]
 
     expected_start = int(datetime(2024, 1, 1, 0, 0, tzinfo=UTC).timestamp() * 1000)
     batch_span_ms = 300 * 60 * 1000  # 300 candles x 1m timeframe

@@ -139,6 +139,7 @@ def test_vif_non_numeric_raises():
         variance_inflation_factor(df)
 
 
+@pytest.mark.filterwarnings("ignore:divide by zero:RuntimeWarning")
 def test_vif_matches_statsmodels():
     """Test VIF output matches statsmodels implementation."""
     np.random.seed(42)

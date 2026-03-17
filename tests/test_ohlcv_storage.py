@@ -12,7 +12,9 @@ import pytest
 from src.data import CoinbaseDataClient
 
 
-def test_save_creates_partition_files_without_month_leakage(tmp_path, sample_df_factory):
+def test_save_creates_partition_files_without_month_leakage(
+    tmp_path, sample_df_factory
+):
     """Save should create month partitions without cross-month contamination."""
     client = CoinbaseDataClient(data_dir=str(tmp_path))
     df = sample_df_factory(
@@ -21,8 +23,12 @@ def test_save_creates_partition_files_without_month_leakage(tmp_path, sample_df_
     )
     client.save(df, "BTC/USD", "1h")
 
-    jan_path = tmp_path / "coinbase" / "ohlcv" / "btc-usd" / "1h" / "2025" / "01.parquet"
-    feb_path = tmp_path / "coinbase" / "ohlcv" / "btc-usd" / "1h" / "2025" / "02.parquet"
+    jan_path = (
+        tmp_path / "coinbase" / "ohlcv" / "btc-usd" / "1h" / "2025" / "01.parquet"
+    )
+    feb_path = (
+        tmp_path / "coinbase" / "ohlcv" / "btc-usd" / "1h" / "2025" / "02.parquet"
+    )
     assert jan_path.exists()
     assert feb_path.exists()
 
