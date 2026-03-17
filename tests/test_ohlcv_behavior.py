@@ -3,7 +3,7 @@
 import asyncio
 import time
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import ccxt
 import polars as pl
@@ -319,6 +319,38 @@ async def test_fetch_and_save_streams_batches(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_fetch_verbose_streaming_reports_total_candles(capsys):
+    """Verbose fetch should report fetched count even when not collecting results."""
+    client = CoinbaseDataClient(
+        batch_concurrency=1,
+        enable_intra_combo_concurrency=False,
+        min_request_interval=0.0,
+        verbosity=Verbosity.VERBOSE,
+    )
+    start_ts = int(datetime(2024, 1, 1, 0, 0, tzinfo=UTC).timestamp() * 1000)
+
+    async def mock_fetch_batch(_exchange, _semaphore, _symbol, _timeframe, since):
+        if since == start_ts:
+            return [[start_ts, 1.0, 1.0, 1.0, 1.0, 1.0]]
+        return []
+
+    with patch.object(client, "_get_exchange", return_value=object()):
+        with patch.object(client, "_fetch_batch", side_effect=mock_fetch_batch):
+            result = await client.fetch(
+                symbol="BTC/USD",
+                timeframe="1m",
+                start_date="2024-01-01 00:00:00",
+                end_date="2024-01-01 00:00:00",
+                verbosity=Verbosity.VERBOSE,
+                collect_results=False,
+            )
+
+    captured = capsys.readouterr().out
+    assert result.is_empty()
+    assert "Completed fetch for BTC/USD 1m: 1 candles fetched" in captured
+
+
+@pytest.mark.asyncio
 async def test_fetch_multiple_and_save_runs_all_combinations():
     """fetch_multiple_and_save should dispatch every symbol/timeframe pair."""
     client = CoinbaseDataClient()
@@ -494,3 +526,54 @@ async def test_fetch_concurrent_bounded_handles_sparse_short_batches():
     assert len(result) == 4
     assert min(call_since_values) == start_ts
     assert end_ts in call_since_values
+
+
+def test_shared_progress_updates_each_batch_immediately():
+    """Shared progress should render every processed batch without large jumps."""
+    client = CoinbaseDataClient()
+    shared_progress = MagicMock()
+
+    pending = client._update_progress(
+        pending_advance=0,
+        progress_task_id=123,
+        shared_progress=shared_progress,
+        progress_tracker=None,
+        use_shared_progress=True,
+        candles_so_far=300,
+        expected_candles=1200,
+    )
+
+    assert pending == 0
+    shared_progress.update.assert_called_once_with(123, advance=1)
+
+
+def test_activity_progress_tracks_active_completed_and_failed():
+    """Activity counters should reflect active, completed, and failed updates."""
+    client = CoinbaseDataClient()
+    shared_progress = MagicMock()
+    activity_state = {
+        "task_id": 99,
+        "active": 0,
+        "completed": 0,
+        "failed": 0,
+        "total": 10,
+    }
+
+    client._update_activity_progress(
+        shared_progress,
+        activity_state,
+        active_delta=1,
+    )
+    client._update_activity_progress(
+        shared_progress,
+        activity_state,
+        advance=2,
+        active_delta=-1,
+        failed_increment=1,
+    )
+
+    assert activity_state["active"] == 0
+    assert activity_state["completed"] == 2
+    assert activity_state["failed"] == 1
+    assert shared_progress.update.call_count == 2
+    assert shared_progress.update.call_args_list[-1].kwargs["advance"] == 2

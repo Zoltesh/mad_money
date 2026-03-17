@@ -22,6 +22,8 @@ from src.data.progress import (
     _is_test_environment,
     build_shared_progress,
     calculate_expected_batches,
+    create_activity_state,
+    format_activity_description,
     get_progress_color,
 )
 
@@ -52,8 +54,9 @@ SUPPORTED_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "2h", "6h", "1d"]
 # Coinbase API limit
 COINBASE_CANDLE_LIMIT = 300
 
-# Progress update interval: batch progress updates to reduce contention in concurrent operations
-PROGRESS_UPDATE_INTERVAL = 10
+# Progress update interval for shared Rich progress updates.
+# Keep this at 1 to provide immediate visual feedback during concurrent fetches.
+PROGRESS_UPDATE_INTERVAL = 1
 
 # Safety guard for unbounded historical fetches with persistent failures when end_date is omitted
 MAX_CONSECUTIVE_RETRYABLE_FAILURES_NO_END_DATE = 5
@@ -348,6 +351,7 @@ class CoinbaseDataClient:
         use_shared_progress: bool,
         candles_so_far: int,
         expected_candles: int,
+        activity_state: dict[str, Any] | None = None,
     ) -> int:
         """Update progress after a batch is processed.
 
@@ -368,6 +372,11 @@ class CoinbaseDataClient:
             pending_advance += 1
             if pending_advance >= PROGRESS_UPDATE_INTERVAL:
                 shared_progress.update(progress_task_id, advance=pending_advance)
+                self._update_activity_progress(
+                    shared_progress,
+                    activity_state,
+                    advance=pending_advance,
+                )
                 return 0
         elif progress_tracker is not None:
             progress_tracker.update(
@@ -385,6 +394,7 @@ class CoinbaseDataClient:
         progress_tracker: ProgressTracker | None,
         use_shared_progress: bool,
         extra: int = 0,
+        activity_state: dict[str, Any] | None = None,
     ) -> None:
         """Flush pending progress updates.
 
@@ -399,8 +409,44 @@ class CoinbaseDataClient:
         total_advance = pending_advance + extra
         if use_shared_progress and shared_progress is not None and total_advance > 0:
             shared_progress.update(progress_task_id, advance=total_advance)
+            self._update_activity_progress(
+                shared_progress,
+                activity_state,
+                advance=total_advance,
+            )
         elif progress_tracker is not None and total_advance > 0:
             progress_tracker.update(n=total_advance)
+
+    @staticmethod
+    def _update_activity_progress(
+        shared_progress: Progress | None,
+        activity_state: dict[str, Any] | None,
+        *,
+        advance: int = 0,
+        failed_increment: int = 0,
+        active_delta: int = 0,
+    ) -> None:
+        """Update aggregate activity status displayed in shared progress."""
+        if shared_progress is None or activity_state is None:
+            return
+
+        activity_state["active"] = max(0, activity_state["active"] + active_delta)
+        activity_state["completed"] = min(
+            activity_state["total"],
+            activity_state["completed"] + advance,
+        )
+        activity_state["failed"] = activity_state["failed"] + failed_increment
+
+        shared_progress.update(
+            activity_state["task_id"],
+            advance=advance,
+            description=format_activity_description(
+                active_requests=activity_state["active"],
+                completed_batches=activity_state["completed"],
+                total_batches=activity_state["total"],
+                failed_batches=activity_state["failed"],
+            ),
+        )
 
     async def _fetch_batch(
         self,
@@ -536,6 +582,7 @@ class CoinbaseDataClient:
         verbosity: Verbosity | None = None,
         progress_task_id: Any = None,
         shared_progress: Progress | None = None,
+        activity_state: dict[str, Any] | None = None,
         on_batch: Callable[[pl.DataFrame], Awaitable[None]] | None = None,
         collect_results: bool = True,
     ) -> pl.DataFrame:
@@ -550,6 +597,7 @@ class CoinbaseDataClient:
             verbosity: Override verbosity level for this call.
             progress_task_id: Task ID from shared Rich Progress (for fetch_multiple).
             shared_progress: Shared Rich Progress instance (for fetch_multiple).
+            activity_state: Shared aggregate activity counters for batch fetches.
             on_batch: Optional async callback executed for each fetched batch DataFrame.
             collect_results: Whether to collect all rows in-memory and return full DataFrame.
 
@@ -568,6 +616,7 @@ class CoinbaseDataClient:
             verbosity=verbosity,
             progress_task_id=progress_task_id,
             shared_progress=shared_progress,
+            activity_state=activity_state,
             on_batch=on_batch,
             collect_results=collect_results,
             verbosity_disabled=Verbosity.DISABLED,
@@ -842,6 +891,7 @@ class CoinbaseDataClient:
         verbosity: Verbosity | None = None,
         progress_task_id: Any = None,
         shared_progress: Progress | None = None,
+        activity_state: dict[str, Any] | None = None,
     ) -> None:
         """Fetch OHLCV data and stream-write each batch to parquet asynchronously."""
 
@@ -857,6 +907,7 @@ class CoinbaseDataClient:
             verbosity=verbosity,
             progress_task_id=progress_task_id,
             shared_progress=shared_progress,
+            activity_state=activity_state,
             on_batch=_write_batch,
             collect_results=False,
         )
@@ -881,6 +932,7 @@ class CoinbaseDataClient:
             )
 
         shared_progress: Progress | None = None
+        activity_state: dict[str, Any] | None = None
         task_ids: dict[tuple[str, str], Any] = {}
         if effective_verbosity != Verbosity.DISABLED:
             shared_progress = build_shared_progress(Progress)
@@ -894,12 +946,21 @@ class CoinbaseDataClient:
             else:
                 end_ts = int(datetime.now(UTC).timestamp() * 1000)
 
+            total_expected_batches = 0
+            expected_batches_by_combo: dict[tuple[str, str], int] = {}
             for symbol, timeframe in combinations:
-                color = get_progress_color(symbol, timeframe)
-                description = f"[{color}]{symbol} {timeframe}[/{color}]"
                 expected_batches = calculate_expected_batches(
                     start_ts, end_ts, timeframe
                 )
+                total_expected_batches += expected_batches
+                expected_batches_by_combo[(symbol, timeframe)] = expected_batches
+
+            activity_state = create_activity_state(shared_progress, total_expected_batches)
+
+            for symbol, timeframe in combinations:
+                color = get_progress_color(symbol, timeframe)
+                description = f"[{color}]{symbol} {timeframe}[/{color}]"
+                expected_batches = expected_batches_by_combo[(symbol, timeframe)]
                 task_id = shared_progress.add_task(description, total=expected_batches)
                 task_ids[(symbol, timeframe)] = task_id
 
@@ -916,6 +977,7 @@ class CoinbaseDataClient:
                     effective_verbosity,
                     progress_task_id=task_id,
                     shared_progress=shared_progress,
+                    activity_state=activity_state,
                 )
             )
             task_metadata.append((symbol, timeframe))
@@ -934,6 +996,11 @@ class CoinbaseDataClient:
                     shared_progress.update(
                         task_id,
                         description=f"[red]{symbol} {timeframe} (failed)[/red]",
+                    )
+                    self._update_activity_progress(
+                        shared_progress,
+                        activity_state,
+                        failed_increment=1,
                     )
                 logger.warning(
                     "Failed to fetch_and_save %s %s: %s: %s",

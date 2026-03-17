@@ -32,7 +32,6 @@ FAV_SYMBOLS = [
                 "LINK/USDC",
                 "LTC/USDC",
                 "MANA/USDC",
-                "MKR/USDC",
                 "NEAR/USDC",
                 "OP/USDC",
                 "QNT/USDC",
@@ -40,6 +39,7 @@ FAV_SYMBOLS = [
                 "SAND/USDC",
                 "SHIB/USDC",
                 "SOL/USDC",
+                "SUI/USDC",
                 "SNX/USDC",
                 "TAO/USDC",
                 "UNI/USDC",
@@ -73,9 +73,9 @@ async def main():
     ) as client:
         await client.fetch_multiple_and_save(
             symbols= FAV_SYMBOLS,
-            timeframes= ["1d"],
-            start_date="2026-01-01",
-            end_date="2026-02-28",
+            timeframes= TIMEFRAMES,
+            start_date="2020-01-01",
+            end_date="2025-12-31",
         )
 
 
