@@ -1,205 +1,158 @@
-"""Tests for sparsity utilities."""
+"""Tests for OHLCV sparsity report utility."""
 
-import math
+from __future__ import annotations
+
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
 
-from src.data.utils.sparsity import (
-    SparsitySeriesStats,
-    expected_rows_for_month,
-    month_to_int,
-    parquet_coverage_report,
-    sparsity_for_column,
-    sparsity_for_series,
-    sparsity_report,
-    timeframe_to_minutes,
-)
+from src.data.utils.sparsity import build_ohlcv_sparsity_report
 
 
-def test_sparsity_for_series_basic() -> None:
-    """Ensure series sparsity counts nan/null correctly."""
-    series = pl.Series("values", [1.0, float("nan"), None])
-    stats = sparsity_for_series(series)
-    assert isinstance(stats, SparsitySeriesStats)
-    assert stats.name == "values"
-    assert stats.total_count == 3
-    assert stats.null_count == 1
-    assert stats.nan_count == 1
-    assert stats.sparse_count == 2
-    assert math.isclose(stats.sparse_pct, 2 / 3)
+def _write_ts_parquet(path: Path, timestamps: Sequence[datetime | str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"timestamp": timestamps}).write_parquet(path)
 
 
-def test_sparsity_report_mixed_types() -> None:
-    """Validate report metrics on mixed-type DataFrame."""
-    df = pl.DataFrame(
-        {
-            "a": [1.0, float("nan"), None],
-            "b": [1, None, 3],
-            "c": [None, None, None],
-        }
-    )
-
-    report = sparsity_report(df)
-
-    assert report["overall"]["total_rows"] == 3
-    assert report["overall"]["total_columns"] == 3
-    assert report["overall"]["total_cells"] == 9
-    assert report["overall"]["null_cells"] == 5
-    assert report["overall"]["nan_cells"] == 1
-    assert report["overall"]["sparse_cells"] == 6
-    assert math.isclose(report["overall"]["sparse_pct"], 6 / 9)
-
-    assert report["rows"]["any_sparse_count"] == 3
-    assert math.isclose(report["rows"]["any_sparse_pct"], 1.0)
-    assert report["rows"]["all_sparse_count"] == 1
-    assert math.isclose(report["rows"]["all_sparse_pct"], 1 / 3)
-
-    assert report["columns"]["any_sparse_count"] == 3
-    assert report["columns"]["all_sparse_count"] == 1
-
-    per_column = report["per_column"]
-    assert per_column.shape == (3, 6)
-    assert sparsity_for_column(df, "a").sparse_count == 2
-
-
-def test_timeframe_to_minutes() -> None:
-    """Ensure timeframes map to expected minute counts."""
-    assert timeframe_to_minutes("1m") == 1
-    assert timeframe_to_minutes("5m") == 5
-    assert timeframe_to_minutes("2h") == 120
-    assert timeframe_to_minutes("1d") == 1440
-    assert timeframe_to_minutes("1w") == 10080
-
-
-def test_expected_rows_for_month() -> None:
-    """Validate expected row counts for key months."""
-    assert expected_rows_for_month(2026, 1, "1m") == 44640
-    assert expected_rows_for_month(2026, 2, "1m") == 40320
-    assert expected_rows_for_month(2024, 2, "1m") == 41760
-    assert expected_rows_for_month(2026, 1, "5m") == 8928
-
-
-def test_month_to_int() -> None:
-    """Normalize month inputs into integer form."""
-    assert month_to_int(1) == 1
-    assert month_to_int("01") == 1
-    assert month_to_int("1") == 1
-    assert month_to_int("jan") == 1
-    assert month_to_int("January") == 1
-
-
-def test_parquet_coverage_report(tmp_path: Path) -> None:
-    """Create parquet data and confirm coverage output."""
+def test_build_ohlcv_sparsity_report_computes_gap_metrics(tmp_path: Path) -> None:
+    """Compute expected metrics from one asset/timeframe with gaps and duplicates."""
     base_path = tmp_path / "ohlcv"
-    symbol = "eth-usdc"
-    timeframe = "1m"
-    year = "2026"
+    asset_path = base_path / "aave-usdc" / "1m" / "2026"
 
-    month_path = base_path / symbol / timeframe / year
-    month_path.mkdir(parents=True)
-    data = pl.DataFrame(
-        {
-            "timestamp": ["2026-01-01T00:00:00Z"] * 10,
-            "open": [1.0] * 10,
-            "high": [1.0] * 10,
-            "low": [1.0] * 10,
-            "close": [1.0] * 10,
-            "volume": [1.0] * 10,
-        }
-    )
-    data.write_parquet(month_path / "01.parquet")
+    timestamps = [
+        datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 0, 1, tzinfo=UTC),
+        datetime(2026, 1, 1, 0, 3, tzinfo=UTC),
+        datetime(2026, 1, 1, 0, 3, tzinfo=UTC),
+    ]
+    _write_ts_parquet(asset_path / "01.parquet", timestamps)
 
-    report = parquet_coverage_report(
-        base_path=base_path,
-        symbols=[symbol],
-        years=[year],
-        months=[1, 2],
-        timeframes=[timeframe],
-    )
+    report = build_ohlcv_sparsity_report(base_path)
 
-    assert report.shape == (2, 7)
-    jan_row = report.filter(pl.col("month") == "jan").row(0, named=True)
-    feb_row = report.filter(pl.col("month") == "feb").row(0, named=True)
-
-    assert jan_row["symbol"] == symbol
-    assert jan_row["year"] == year
-    assert jan_row["month"] == "jan"
-    assert jan_row["timeframe"] == timeframe
-    assert jan_row["row_count"] == 10
-    assert jan_row["max_possible"] == 44640
-    assert jan_row["ratio"] == 0.0
-
-    assert feb_row["month"] == "feb"
-    assert feb_row["row_count"] == 0
-    assert feb_row["max_possible"] == 40320
-    assert feb_row["ratio"] == 0.0
-
-
-def test_parquet_coverage_report_rounds_down(tmp_path: Path) -> None:
-    """Ensure ratio floors to nearest hundredth."""
-    base_path = tmp_path / "ohlcv"
-    symbol = "eth-usdc"
-    timeframe = "5m"
-    year = "2026"
-
-    month_path = base_path / symbol / timeframe / year
-    month_path.mkdir(parents=True)
-    data = pl.DataFrame(
-        {
-            "timestamp": ["2026-01-01T00:00:00Z"] * 8063,
-            "open": [1.0] * 8063,
-            "high": [1.0] * 8063,
-            "low": [1.0] * 8063,
-            "close": [1.0] * 8063,
-            "volume": [1.0] * 8063,
-        }
-    )
-    data.write_parquet(month_path / "02.parquet")
-
-    report = parquet_coverage_report(
-        base_path=base_path,
-        symbols=[symbol],
-        years=[year],
-        months=[2],
-        timeframes=[timeframe],
-    )
-    feb_row = report.filter(pl.col("month") == "feb").row(0, named=True)
-    assert feb_row["ratio"] == 0.99
-
-
-def test_parquet_coverage_report_discovers_all(tmp_path: Path) -> None:
-    """Discover symbols/timeframes/years/months when omitted."""
-    base_path = tmp_path / "ohlcv"
-
-    valid_symbol = "eth-usdc"
-    invalid_symbol = "ethusdc"
-    timeframe = "1m"
-    year = "2026"
-
-    valid_path = base_path / valid_symbol / timeframe / year
-    invalid_path = base_path / invalid_symbol / timeframe / year
-    valid_path.mkdir(parents=True)
-    invalid_path.mkdir(parents=True)
-
-    data = pl.DataFrame(
-        {
-            "timestamp": ["2026-01-01T00:00:00Z"] * 3,
-            "open": [1.0] * 3,
-            "high": [1.0] * 3,
-            "low": [1.0] * 3,
-            "close": [1.0] * 3,
-            "volume": [1.0] * 3,
-        }
-    )
-    data.write_parquet(valid_path / "01.parquet")
-    data.write_parquet(invalid_path / "01.parquet")
-
-    report = parquet_coverage_report(base_path=base_path)
-
-    assert report.shape == (1, 7)
+    assert report.shape == (1, 15)
     row = report.row(0, named=True)
-    assert row["symbol"] == valid_symbol
-    assert row["year"] == year
-    assert row["month"] == "jan"
-    assert row["timeframe"] == timeframe
+    assert row["asset"] == "aave-usdc"
+    assert row["timeframe"] == "1m"
+    assert row["files_processed"] == 1
+    assert row["actual"] == 3
+    assert row["expected"] == 4
+    assert row["missing"] == 1
+    assert row["availability"] == 0.75
+    assert row["sparsity"] == 0.25
+    assert row["gap_count"] == 1
+    assert row["avg_gap_missing"] == 1.0
+    assert row["shortest_gap_missing"] == 1
+    assert row["largest_gap_missing"] == 1
+    assert row["avg_extra_gap_seconds"] == 60.0
+
+
+def test_build_ohlcv_sparsity_report_normalizes_requested_assets(
+    tmp_path: Path,
+) -> None:
+    """Normalize optional asset filter to lowercase and process only requested."""
+    base_path = tmp_path / "ohlcv"
+    _write_ts_parquet(
+        base_path / "aave-usdc" / "1m" / "2026" / "01.parquet",
+        [datetime(2026, 1, 1, 0, 0, tzinfo=UTC)],
+    )
+    _write_ts_parquet(
+        base_path / "btc-usdc" / "1m" / "2026" / "01.parquet",
+        [datetime(2026, 1, 1, 0, 0, tzinfo=UTC)],
+    )
+
+    report = build_ohlcv_sparsity_report(base_path, assets=["AAVE-USDC"])
+    assert report.shape == (1, 15)
+    assert report.row(0, named=True)["asset"] == "aave-usdc"
+
+
+def test_build_ohlcv_sparsity_report_skips_invalid_structure_and_warns(
+    tmp_path: Path, caplog
+) -> None:
+    """Warn and continue when encountering invalid assets/timeframes/years/files."""
+    base_path = tmp_path / "ohlcv"
+
+    _write_ts_parquet(
+        base_path / "aave-usdc" / "1m" / "2026" / "01.parquet",
+        [datetime(2026, 1, 1, 0, 0, tzinfo=UTC)],
+    )
+    _write_ts_parquet(
+        base_path / "aave-usdc" / "1m" / "2026" / "1.parquet",
+        [datetime(2026, 1, 1, 0, 1, tzinfo=UTC)],
+    )
+    _write_ts_parquet(
+        base_path / "aave-usdc" / "1m" / "26" / "01.parquet",
+        [datetime(2026, 1, 1, 0, 2, tzinfo=UTC)],
+    )
+    _write_ts_parquet(
+        base_path / "aave-usdc" / "1M" / "2026" / "01.parquet",
+        [datetime(2026, 1, 1, 0, 3, tzinfo=UTC)],
+    )
+    _write_ts_parquet(
+        base_path / "aave-usdc" / "1m" / "2026" / "02.parquet",
+        ["bad-ts", "2026-01-01T00:01:00Z"],
+    )
+    _write_ts_parquet(
+        base_path / "AAVE-USDC" / "1m" / "2026" / "01.parquet",
+        [datetime(2026, 1, 1, 0, 4, tzinfo=UTC)],
+    )
+
+    caplog.set_level("WARNING")
+    report = build_ohlcv_sparsity_report(base_path)
+
+    assert report.shape == (1, 15)
+    messages = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "invalid asset 'AAVE-USDC' skipped" in messages
+    assert "invalid timeframe '1M' skipped" in messages
+    assert "invalid year '26' skipped" in messages
+    assert "invalid month file '1.parquet' skipped" in messages
+    assert "invalid timestamp values in" in messages
+
+
+def test_build_ohlcv_sparsity_report_returns_empty_when_no_valid_data(
+    tmp_path: Path,
+) -> None:
+    """Return empty report when no valid asset data is available."""
+    base_path = tmp_path / "ohlcv"
+    (base_path / "invalid-asset-name").mkdir(parents=True)
+
+    report = build_ohlcv_sparsity_report(base_path)
+
+    assert report.is_empty()
+    assert report.columns == [
+        "asset",
+        "timeframe",
+        "range_start",
+        "range_end",
+        "files_processed",
+        "actual",
+        "expected",
+        "missing",
+        "availability",
+        "sparsity",
+        "gap_count",
+        "avg_gap_missing",
+        "shortest_gap_missing",
+        "largest_gap_missing",
+        "avg_extra_gap_seconds",
+    ]
+
+
+def test_build_ohlcv_sparsity_report_floors_float_metrics(tmp_path: Path) -> None:
+    """Floor float metrics to 2 decimals instead of rounding."""
+    base_path = tmp_path / "ohlcv"
+    asset_path = base_path / "eth-usdc" / "1m" / "2026"
+
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    timestamps = [start + timedelta(minutes=minute) for minute in range(1000)]
+    timestamps.pop(500)
+    _write_ts_parquet(asset_path / "01.parquet", timestamps)
+
+    report = build_ohlcv_sparsity_report(base_path)
+    row = report.row(0, named=True)
+
+    assert row["actual"] == 999
+    assert row["expected"] == 1000
+    assert row["availability"] == 0.99
+    assert row["sparsity"] == 0.0

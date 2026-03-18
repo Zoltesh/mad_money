@@ -220,7 +220,9 @@ class CoinbaseDataClient:
             if delay > 0:
                 await asyncio.sleep(delay)
                 now = loop.time()
-            self._next_request_at = max(now, self._next_request_at) + self.min_request_interval
+            self._next_request_at = (
+                max(now, self._next_request_at) + self.min_request_interval
+            )
 
     def _resolve_verbosity(self, verbosity: Verbosity | None) -> Verbosity:
         """Resolve effective verbosity level.
@@ -528,7 +530,11 @@ class CoinbaseDataClient:
                     delay = self.rate_limit_backoff * (2**attempt)
                     # Add jitter while preserving monotonic backoff growth.
                     jitter = delay * (1.0 + (0.5 * random.random()))
-                    log_retry = logger.warning if self.verbosity == Verbosity.VERBOSE else logger.info
+                    log_retry = (
+                        logger.warning
+                        if self.verbosity == Verbosity.VERBOSE
+                        else logger.info
+                    )
                     log_retry(
                         "Rate limit hit (attempt %d/%d): %s - %s. Retrying in %.2fs.",
                         attempt + 1,
@@ -547,7 +553,11 @@ class CoinbaseDataClient:
                 if attempt < self.max_retries:
                     delay = self.rate_limit_backoff * (2**attempt)
                     jitter = delay * (1.0 + (0.5 * random.random()))
-                    log_retry = logger.warning if self.verbosity == Verbosity.VERBOSE else logger.info
+                    log_retry = (
+                        logger.warning
+                        if self.verbosity == Verbosity.VERBOSE
+                        else logger.info
+                    )
                     log_retry(
                         "Retryable exchange error (attempt %d/%d): %s. Retrying in %.2fs.",
                         attempt + 1,
@@ -558,9 +568,7 @@ class CoinbaseDataClient:
                     await asyncio.sleep(jitter)
             except NON_RETRYABLE_EXCEPTIONS as e:
                 # Permanent error - log and re-raise
-                logger.warning(
-                    "Non-retryable exception: %s - %s", type(e).__name__, e
-                )
+                logger.warning("Non-retryable exception: %s - %s", type(e).__name__, e)
                 raise
 
         # All retries exhausted
@@ -971,7 +979,9 @@ class CoinbaseDataClient:
                 total_expected_batches += expected_batches
                 expected_batches_by_combo[(symbol, timeframe)] = expected_batches
 
-            activity_state = create_activity_state(shared_progress, total_expected_batches)
+            activity_state = create_activity_state(
+                shared_progress, total_expected_batches
+            )
 
             for symbol, timeframe in combinations:
                 color = get_progress_color(symbol, timeframe)

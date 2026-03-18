@@ -12,7 +12,9 @@ from rich.progress import Progress
 from src.data.progress import build_shared_progress
 
 
-def _mark_task_failed(shared_progress: Progress | None, task_id: Any, label: str) -> None:
+def _mark_task_failed(
+    shared_progress: Progress | None, task_id: Any, label: str
+) -> None:
     """Mark a progress task as failed."""
     if shared_progress is not None and task_id is not None:
         shared_progress.update(task_id, completed=0)
@@ -48,7 +50,9 @@ async def _fetch_bounded_window(
     window_candles: list[list[float]] = []
 
     while cursor <= window_end:
-        client._update_activity_progress(shared_progress, activity_state, active_delta=1)
+        client._update_activity_progress(
+            shared_progress, activity_state, active_delta=1
+        )
         try:
             candles = await client._fetch_batch(
                 exchange, semaphore, symbol, timeframe, int(cursor)
@@ -58,12 +62,16 @@ async def _fetch_bounded_window(
                 shared_progress, activity_state, active_delta=-1
             )
             raise
-        client._update_activity_progress(shared_progress, activity_state, active_delta=-1)
+        client._update_activity_progress(
+            shared_progress, activity_state, active_delta=-1
+        )
 
         if not candles:
             break
 
-        window_candles.extend([c for c in candles if c[0] <= end_ts and c[0] <= window_end])
+        window_candles.extend(
+            [c for c in candles if c[0] <= end_ts and c[0] <= window_end]
+        )
         last_candle_ts = candles[-1][0]
         if last_candle_ts < cursor:
             break
@@ -254,7 +262,9 @@ async def _execute_fetch_sequential(
                             if collect_results:
                                 all_candles.extend(batch_candles)
                             if on_batch is not None:
-                                await on_batch(client._candles_to_dataframe(batch_candles))
+                                await on_batch(
+                                    client._candles_to_dataframe(batch_candles)
+                                )
                     break
                 except non_retryable_exceptions:
                     client._update_activity_progress(
@@ -586,56 +596,60 @@ async def execute_fetch(
 
     try:
         if use_concurrent_bounded:
-            all_candles, total_candles_fetched, failed_batches = (
-                await _execute_fetch_concurrent_bounded(
-                    client=client,
-                    exchange=exchange,
-                    semaphore=semaphore,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    start_ts=start_ts,
-                    end_ts=end_ts,
-                    timeframe_ms=timeframe_ms,
-                    collect_results=collect_results,
-                    on_batch=on_batch,
-                    progress_task_id=progress_task_id,
-                    shared_progress=shared_progress,
-                    activity_state=activity_state,
-                    progress_tracker=progress_tracker,
-                    use_shared_progress=use_shared_progress,
-                    expected_candles=expected_candles,
-                    coinbase_candle_limit=coinbase_candle_limit,
-                    retryable_exceptions=retryable_exceptions,
-                    non_retryable_exceptions=non_retryable_exceptions,
-                    logger=logger,
-                )
+            (
+                all_candles,
+                total_candles_fetched,
+                failed_batches,
+            ) = await _execute_fetch_concurrent_bounded(
+                client=client,
+                exchange=exchange,
+                semaphore=semaphore,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                timeframe_ms=timeframe_ms,
+                collect_results=collect_results,
+                on_batch=on_batch,
+                progress_task_id=progress_task_id,
+                shared_progress=shared_progress,
+                activity_state=activity_state,
+                progress_tracker=progress_tracker,
+                use_shared_progress=use_shared_progress,
+                expected_candles=expected_candles,
+                coinbase_candle_limit=coinbase_candle_limit,
+                retryable_exceptions=retryable_exceptions,
+                non_retryable_exceptions=non_retryable_exceptions,
+                logger=logger,
             )
         else:
-            all_candles, total_candles_fetched, failed_batches = (
-                await _execute_fetch_sequential(
-                    client=client,
-                    exchange=exchange,
-                    semaphore=semaphore,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    since=start_ts,
-                    end_ts=end_ts,
-                    end_date=end_date,
-                    timeframe_ms=timeframe_ms,
-                    collect_results=collect_results,
-                    on_batch=on_batch,
-                    progress_task_id=progress_task_id,
-                    shared_progress=shared_progress,
-                    activity_state=activity_state,
-                    progress_tracker=progress_tracker,
-                    use_shared_progress=use_shared_progress,
-                    expected_candles=expected_candles,
-                    coinbase_candle_limit=coinbase_candle_limit,
-                    max_consecutive_retryable_failures_no_end_date=max_consecutive_retryable_failures_no_end_date,
-                    retryable_exceptions=retryable_exceptions,
-                    non_retryable_exceptions=non_retryable_exceptions,
-                    logger=logger,
-                )
+            (
+                all_candles,
+                total_candles_fetched,
+                failed_batches,
+            ) = await _execute_fetch_sequential(
+                client=client,
+                exchange=exchange,
+                semaphore=semaphore,
+                symbol=symbol,
+                timeframe=timeframe,
+                since=start_ts,
+                end_ts=end_ts,
+                end_date=end_date,
+                timeframe_ms=timeframe_ms,
+                collect_results=collect_results,
+                on_batch=on_batch,
+                progress_task_id=progress_task_id,
+                shared_progress=shared_progress,
+                activity_state=activity_state,
+                progress_tracker=progress_tracker,
+                use_shared_progress=use_shared_progress,
+                expected_candles=expected_candles,
+                coinbase_candle_limit=coinbase_candle_limit,
+                max_consecutive_retryable_failures_no_end_date=max_consecutive_retryable_failures_no_end_date,
+                retryable_exceptions=retryable_exceptions,
+                non_retryable_exceptions=non_retryable_exceptions,
+                logger=logger,
             )
 
         if failed_batches > 0:
@@ -701,7 +715,9 @@ async def execute_fetch_multiple(
 
         start_ts = int(client._parse_date(start_date).timestamp() * 1000)
         if end_date:
-            end_ts = int(client._parse_date(end_date, end_of_day=True).timestamp() * 1000)
+            end_ts = int(
+                client._parse_date(end_date, end_of_day=True).timestamp() * 1000
+            )
         else:
             end_ts = int(datetime.now(UTC).timestamp() * 1000)
 

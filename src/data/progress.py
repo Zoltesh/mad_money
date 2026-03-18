@@ -87,7 +87,10 @@ def build_shared_progress(progress_class: Any) -> Progress:
 
 
 def format_activity_description(
-    active_requests: int, completed_batches: int, total_batches: int, failed_batches: int
+    active_requests: int,
+    completed_batches: int,
+    total_batches: int,
+    failed_batches: int,
 ) -> str:
     """Build a readable shared activity status line."""
     return (
@@ -98,7 +101,9 @@ def format_activity_description(
     )
 
 
-def create_activity_state(shared_progress: Progress, total_batches: int) -> dict[str, Any]:
+def create_activity_state(
+    shared_progress: Progress, total_batches: int
+) -> dict[str, Any]:
     """Create activity tracking state and add the aggregate progress task."""
     normalized_total = max(1, total_batches)
     initial_description = format_activity_description(

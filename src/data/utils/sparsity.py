@@ -1,393 +1,325 @@
-"""Polars-native sparsity utilities."""
+"""OHLCV sparsity and gap report utilities."""
 
 from __future__ import annotations
 
-import calendar
+import logging
 import math
 import re
-from collections.abc import Iterable
-from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
 
 import polars as pl
 
+logger = logging.getLogger(__name__)
 
-@dataclass(frozen=True, slots=True)
-class SparsitySeriesStats:
-    """Sparsity statistics for a single series."""
+VALID_TIMEFRAME_MINUTES: dict[str, int] = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "2h": 120,
+    "6h": 360,
+    "1d": 1_440,
+}
 
-    name: str
-    total_count: int
-    null_count: int
-    nan_count: int
-    sparse_count: int
-    sparse_pct: float
+_ASSET_PATTERN = re.compile(r"^[a-z0-9]+-[a-z0-9]+$")
+_ASSET_PATTERN_CASE_INSENSITIVE = re.compile(r"^[A-Za-z0-9]+-[A-Za-z0-9]+$")
+_YEAR_PATTERN = re.compile(r"^\d{4}$")
+_MONTH_FILE_PATTERN = re.compile(r"^(0[1-9]|1[0-2])\.parquet$")
 
-    def as_dict(self) -> dict[str, Any]:
-        """Return stats as a plain dictionary."""
-        return {
-            "name": self.name,
-            "total_count": self.total_count,
-            "null_count": self.null_count,
-            "nan_count": self.nan_count,
-            "sparse_count": self.sparse_count,
-            "sparse_pct": self.sparse_pct,
-        }
+_REPORT_SCHEMA = {
+    "asset": pl.String,
+    "timeframe": pl.String,
+    "range_start": pl.Datetime(time_unit="us", time_zone="UTC"),
+    "range_end": pl.Datetime(time_unit="us", time_zone="UTC"),
+    "files_processed": pl.Int64,
+    "actual": pl.Int64,
+    "expected": pl.Int64,
+    "missing": pl.Int64,
+    "availability": pl.Float64,
+    "sparsity": pl.Float64,
+    "gap_count": pl.Int64,
+    "avg_gap_missing": pl.Float64,
+    "shortest_gap_missing": pl.Int64,
+    "largest_gap_missing": pl.Int64,
+    "avg_extra_gap_seconds": pl.Float64,
+}
+
+
+def timeframe_to_minutes(timeframe: str) -> int:
+    """Return timeframe size in minutes."""
+    try:
+        return VALID_TIMEFRAME_MINUTES[timeframe]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported timeframe: {timeframe}") from exc
+
+
+def build_ohlcv_sparsity_report(
+    base_path: Path | str,
+    assets: list[str] | None = None,
+) -> pl.DataFrame:
+    """Build a machine-friendly sparsity report for OHLCV parquet data."""
+    root = Path(base_path)
+    if not root.exists():
+        logger.warning("base path '%s' does not exist", root)
+        return pl.DataFrame(schema=_REPORT_SCHEMA)
+
+    discovered_assets = _discover_valid_assets(root)
+    requested_assets = _normalize_requested_assets(assets)
+    if requested_assets:
+        for asset in sorted(requested_assets - discovered_assets):
+            logger.warning("requested asset '%s' not found", asset)
+        assets_to_process = sorted(discovered_assets & requested_assets)
+    else:
+        assets_to_process = sorted(discovered_assets)
+
+    rows: list[dict[str, object]] = []
+    for asset in assets_to_process:
+        rows.extend(_build_asset_rows(root / asset, asset))
+
+    if not rows:
+        return pl.DataFrame(schema=_REPORT_SCHEMA)
+    return pl.DataFrame(rows, schema=_REPORT_SCHEMA)
+
+
+def _normalize_requested_assets(assets: list[str] | None) -> set[str]:
+    if not assets:
+        return set()
+    return {asset.strip().lower() for asset in assets if asset.strip()}
+
+
+def _discover_valid_assets(root: Path) -> set[str]:
+    valid_assets: set[str] = set()
+    for asset_dir in _iter_dirs(root):
+        name = asset_dir.name
+        if _ASSET_PATTERN.fullmatch(name):
+            valid_assets.add(name)
+            continue
+
+        if _ASSET_PATTERN_CASE_INSENSITIVE.fullmatch(name):
+            logger.warning(
+                "invalid asset '%s' skipped: use lowercase <base-quote>", name
+            )
+        else:
+            logger.warning("invalid asset '%s' skipped", name)
+    return valid_assets
+
+
+def _build_asset_rows(asset_path: Path, asset: str) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for timeframe_dir in _iter_dirs(asset_path):
+        timeframe = timeframe_dir.name
+        if timeframe in VALID_TIMEFRAME_MINUTES:
+            row = _build_timeframe_row(asset, timeframe_dir, timeframe)
+            if row is not None:
+                rows.append(row)
+            continue
+
+        if timeframe.lower() in VALID_TIMEFRAME_MINUTES:
+            logger.warning(
+                "invalid timeframe '%s' skipped for asset '%s': use lowercase",
+                timeframe,
+                asset,
+            )
+        else:
+            logger.warning(
+                "invalid timeframe '%s' skipped for asset '%s'",
+                timeframe,
+                asset,
+            )
+    return rows
+
+
+def _build_timeframe_row(
+    asset: str, timeframe_path: Path, timeframe: str
+) -> dict[str, object] | None:
+    epoch_chunks: list[pl.Series] = []
+    files_processed = 0
+    for year_dir in _iter_dirs(timeframe_path):
+        year_name = year_dir.name
+        if not _YEAR_PATTERN.fullmatch(year_name):
+            logger.warning(
+                "invalid year '%s' skipped for %s/%s",
+                year_name,
+                asset,
+                timeframe,
+            )
+            continue
+
+        for month_file in sorted(year_dir.iterdir()):
+            if not month_file.is_file():
+                continue
+            if not month_file.name.endswith(".parquet"):
+                logger.warning(
+                    "invalid month file '%s' skipped for %s/%s/%s",
+                    month_file.name,
+                    asset,
+                    timeframe,
+                    year_name,
+                )
+                continue
+            if not _MONTH_FILE_PATTERN.fullmatch(month_file.name):
+                if month_file.stem.isdigit() and 1 <= int(month_file.stem) <= 12:
+                    logger.warning(
+                        "invalid month file '%s' skipped for %s/%s/%s: "
+                        "use leading zero",
+                        month_file.name,
+                        asset,
+                        timeframe,
+                        year_name,
+                    )
+                else:
+                    logger.warning(
+                        "invalid month file '%s' skipped for %s/%s/%s",
+                        month_file.name,
+                        asset,
+                        timeframe,
+                        year_name,
+                    )
+                continue
+
+            epoch_series = _read_timestamp_epoch_us(month_file)
+            if epoch_series is None:
+                continue
+            files_processed += 1
+            if epoch_series.len() > 0:
+                epoch_chunks.append(epoch_series)
+
+    if not epoch_chunks:
+        if files_processed > 0:
+            logger.warning(
+                "no valid timestamps found for %s/%s (processed %d files)",
+                asset,
+                timeframe,
+                files_processed,
+            )
+        return None
+
+    combined = pl.concat(epoch_chunks)
+    unique = combined.unique().sort()
+    actual = int(unique.len())
+    raw_count = int(combined.len())
+    duplicate_count = raw_count - actual
+    if duplicate_count > 0:
+        logger.warning(
+            "duplicate timestamps detected for %s/%s: %d duplicates ignored",
+            asset,
+            timeframe,
+            duplicate_count,
+        )
+
+    start_us = int(unique[0])
+    end_us = int(unique[-1])
+    cadence_us = timeframe_to_minutes(timeframe) * 60 * 1_000_000
+
+    expected = ((end_us - start_us) // cadence_us) + 1
+    missing = max(expected - actual, 0)
+    availability = _floor_2(_safe_div(actual, expected))
+    sparsity = _floor_2(_safe_div(missing, expected))
+
+    deltas = unique.diff().drop_nulls()
+    gap_deltas = deltas.filter(deltas > cadence_us)
+    gap_count = int(gap_deltas.len())
+
+    if gap_count == 0:
+        avg_gap_missing = 0.0
+        shortest_gap_missing: int | None = None
+        largest_gap_missing: int | None = None
+        avg_extra_gap_seconds = 0.0
+    else:
+        gap_missing = (gap_deltas // cadence_us) - 1
+        avg_gap_missing = _floor_2(float(gap_missing.mean() or 0.0))
+        shortest_gap_missing = int(gap_missing.min())
+        largest_gap_missing = int(gap_missing.max())
+        extra_gap_seconds = (gap_deltas - cadence_us) / 1_000_000
+        avg_extra_gap_seconds = _floor_2(float(extra_gap_seconds.mean() or 0.0))
+
+    return {
+        "asset": asset,
+        "timeframe": timeframe,
+        "range_start": datetime.fromtimestamp(start_us / 1_000_000, tz=UTC),
+        "range_end": datetime.fromtimestamp(end_us / 1_000_000, tz=UTC),
+        "files_processed": files_processed,
+        "actual": actual,
+        "expected": expected,
+        "missing": missing,
+        "availability": availability,
+        "sparsity": sparsity,
+        "gap_count": gap_count,
+        "avg_gap_missing": avg_gap_missing,
+        "shortest_gap_missing": shortest_gap_missing,
+        "largest_gap_missing": largest_gap_missing,
+        "avg_extra_gap_seconds": avg_extra_gap_seconds,
+    }
+
+
+def _read_timestamp_epoch_us(parquet_file: Path) -> pl.Series | None:
+    try:
+        frame = pl.read_parquet(parquet_file, columns=["timestamp"])
+    except Exception as exc:  # pragma: no cover - backend-specific read failures
+        logger.warning("failed reading '%s': %s", parquet_file, exc)
+        return None
+
+    if "timestamp" not in frame.columns:
+        logger.warning("missing timestamp column in '%s'", parquet_file)
+        return None
+
+    raw_series = frame.get_column("timestamp")
+    non_null_before = raw_series.len() - raw_series.null_count()
+    epoch_series = _timestamp_to_epoch_us(raw_series, parquet_file)
+    if epoch_series is None:
+        return None
+
+    non_null_after = epoch_series.len() - epoch_series.null_count()
+    invalid_values = max(non_null_before - non_null_after, 0)
+    if invalid_values > 0:
+        logger.warning(
+            "invalid timestamp values in '%s': %d values ignored",
+            parquet_file,
+            invalid_values,
+        )
+    return epoch_series.drop_nulls().cast(pl.Int64)
+
+
+def _timestamp_to_epoch_us(series: pl.Series, parquet_file: Path) -> pl.Series | None:
+    dtype_name = str(series.dtype)
+    if dtype_name.startswith("Datetime("):
+        return series.dt.epoch("us")
+    if dtype_name == "Date":
+        return series.cast(pl.Datetime(time_unit="us")).dt.epoch("us")
+    if dtype_name == "String":
+        parsed = series.str.strptime(
+            pl.Datetime(time_unit="us", time_zone="UTC"),
+            strict=False,
+        )
+        return parsed.dt.epoch("us")
+
+    logger.warning(
+        "unsupported timestamp dtype '%s' in '%s'",
+        series.dtype,
+        parquet_file,
+    )
+    return None
+
+
+def _iter_dirs(path: Path) -> list[Path]:
+    if not path.exists():
+        return []
+    return sorted(
+        (item for item in path.iterdir() if item.is_dir()), key=lambda p: p.name
+    )
 
 
 def _safe_div(numerator: int, denominator: int) -> float:
     return float(numerator) / float(denominator) if denominator else 0.0
 
 
-def _is_float_dtype(dtype: pl.DataType) -> bool:
-    return dtype in (pl.Float32, pl.Float64)
-
-
-def _sparse_expr(name: str, dtype: pl.DataType) -> pl.Expr:
-    col = pl.col(name)
-    if _is_float_dtype(dtype):
-        return col.is_null() | col.is_nan()
-    return col.is_null()
-
-
-def sparsity_for_series(series: pl.Series) -> SparsitySeriesStats:
-    """Return sparsity stats for a single series."""
-    name = series.name or "series"
-    total_count = series.len()
-    null_count = series.null_count()
-    if _is_float_dtype(series.dtype):
-        nan_count = int(series.is_nan().sum())
-    else:
-        nan_count = 0
-    sparse_count = null_count + nan_count
-    sparse_pct = _safe_div(sparse_count, total_count)
-    return SparsitySeriesStats(
-        name=name,
-        total_count=total_count,
-        null_count=null_count,
-        nan_count=nan_count,
-        sparse_count=sparse_count,
-        sparse_pct=sparse_pct,
-    )
-
-
-def sparsity_for_column(df: pl.DataFrame, column: str) -> SparsitySeriesStats:
-    """Return sparsity stats for a DataFrame column."""
-    return sparsity_for_series(df.get_column(column))
-
-
-def sparsity_report(df: pl.DataFrame) -> dict[str, Any]:
-    """Return a comprehensive sparsity report for a DataFrame."""
-    total_rows = df.height
-    total_columns = df.width
-    total_cells = total_rows * total_columns
-
-    if total_columns == 0:
-        return {
-            "overall": {
-                "total_rows": total_rows,
-                "total_columns": total_columns,
-                "total_cells": total_cells,
-                "null_cells": 0,
-                "nan_cells": 0,
-                "sparse_cells": 0,
-                "sparse_pct": 0.0,
-            },
-            "rows": {
-                "any_sparse_count": 0,
-                "any_sparse_pct": 0.0,
-                "all_sparse_count": 0,
-                "all_sparse_pct": 0.0,
-            },
-            "columns": {
-                "any_sparse_count": 0,
-                "any_sparse_pct": 0.0,
-                "all_sparse_count": 0,
-                "all_sparse_pct": 0.0,
-                "sparse_pct_mean": 0.0,
-                "sparse_pct_std": 0.0,
-            },
-            "per_column": pl.DataFrame(
-                {
-                    "column": [],
-                    "total_count": [],
-                    "null_count": [],
-                    "nan_count": [],
-                    "sparse_count": [],
-                    "sparse_pct": [],
-                }
-            ),
-        }
-
-    schema = df.schema
-    sparse_exprs = [_sparse_expr(name, dtype) for name, dtype in schema.items()]
-
-    count_exprs: list[pl.Expr] = []
-    for name, dtype in schema.items():
-        col = pl.col(name)
-        null_expr = col.is_null().sum().alias(f"{name}__null_count")
-        if _is_float_dtype(dtype):
-            nan_expr = col.is_nan().sum().alias(f"{name}__nan_count")
-            sparse_expr = (
-                (col.is_null() | col.is_nan()).sum().alias(f"{name}__sparse_count")
-            )
-        else:
-            nan_expr = pl.lit(0).alias(f"{name}__nan_count")
-            sparse_expr = col.is_null().sum().alias(f"{name}__sparse_count")
-        count_exprs.extend([null_expr, nan_expr, sparse_expr])
-
-    rows_exprs = [
-        pl.any_horizontal(sparse_exprs).sum().alias("__rows_any_sparse"),
-        pl.all_horizontal(sparse_exprs).sum().alias("__rows_all_sparse"),
-    ]
-
-    counts_row = df.select(count_exprs + rows_exprs).row(0)
-    counts_cols = count_exprs + rows_exprs
-    counts = dict(zip([expr.meta.output_name() for expr in counts_cols], counts_row))
-
-    per_column_rows = []
-    sparse_cells = 0
-    null_cells = 0
-    nan_cells = 0
-
-    for name in schema:
-        total_count = total_rows
-        null_count = int(counts[f"{name}__null_count"])
-        nan_count = int(counts[f"{name}__nan_count"])
-        sparse_count = int(counts[f"{name}__sparse_count"])
-        sparse_pct = _safe_div(sparse_count, total_count)
-        per_column_rows.append(
-            {
-                "column": name,
-                "total_count": total_count,
-                "null_count": null_count,
-                "nan_count": nan_count,
-                "sparse_count": sparse_count,
-                "sparse_pct": sparse_pct,
-            }
-        )
-        sparse_cells += sparse_count
-        null_cells += null_count
-        nan_cells += nan_count
-
-    per_column = pl.DataFrame(per_column_rows)
-
-    row_any_sparse = int(counts["__rows_any_sparse"])
-    row_all_sparse = int(counts["__rows_all_sparse"])
-
-    mean_value = per_column["sparse_pct"].mean() if total_columns else None
-    std_value = per_column["sparse_pct"].std() if total_columns else None
-    sparse_pct_mean = cast(float, mean_value) if mean_value is not None else 0.0
-    sparse_pct_std = cast(float, std_value) if std_value is not None else 0.0
-
-    any_sparse_cols = int((per_column["sparse_count"] > 0).sum())
-    all_sparse_cols = int((per_column["sparse_count"] == total_rows).sum())
-
-    return {
-        "overall": {
-            "total_rows": total_rows,
-            "total_columns": total_columns,
-            "total_cells": total_cells,
-            "null_cells": null_cells,
-            "nan_cells": nan_cells,
-            "sparse_cells": sparse_cells,
-            "sparse_pct": _safe_div(sparse_cells, total_cells),
-        },
-        "rows": {
-            "any_sparse_count": row_any_sparse,
-            "any_sparse_pct": _safe_div(row_any_sparse, total_rows),
-            "all_sparse_count": row_all_sparse,
-            "all_sparse_pct": _safe_div(row_all_sparse, total_rows),
-        },
-        "columns": {
-            "any_sparse_count": any_sparse_cols,
-            "any_sparse_pct": _safe_div(any_sparse_cols, total_columns),
-            "all_sparse_count": all_sparse_cols,
-            "all_sparse_pct": _safe_div(all_sparse_cols, total_columns),
-            "sparse_pct_mean": sparse_pct_mean,
-            "sparse_pct_std": sparse_pct_std,
-        },
-        "per_column": per_column,
-    }
-
-
-def timeframe_to_minutes(timeframe: str) -> int:
-    """Convert a timeframe string (e.g., 1m, 5m, 1h) to minutes."""
-    raw = timeframe.strip().lower()
-    if len(raw) < 2:
-        raise ValueError(f"Invalid timeframe: {timeframe}")
-
-    value_part = raw[:-1]
-    unit = raw[-1]
-    if not value_part.isdigit():
-        raise ValueError(f"Invalid timeframe: {timeframe}")
-
-    value = int(value_part)
-    if value <= 0:
-        raise ValueError(f"Invalid timeframe: {timeframe}")
-
-    if unit == "m":
-        return value
-    if unit == "h":
-        return value * 60
-    if unit == "d":
-        return value * 1440
-    if unit == "w":
-        return value * 7 * 1440
-
-    raise ValueError(f"Unsupported timeframe: {timeframe}")
-
-
-def expected_rows_for_month(year: int, month: int, timeframe: str) -> int:
-    """Return the max possible rows for a month/timeframe combination."""
-    minutes = timeframe_to_minutes(timeframe)
-    minutes_per_day = 24 * 60
-    if minutes_per_day % minutes != 0:
-        raise ValueError(f"Timeframe {timeframe} does not align to full days")
-
-    days_in_month = calendar.monthrange(year, month)[1]
-    candles_per_day = minutes_per_day // minutes
-    return days_in_month * candles_per_day
-
-
-def month_to_int(month: int | str) -> int:
-    """Normalize a month value into its integer form (1-12)."""
-    if isinstance(month, int):
-        month_int = month
-    else:
-        raw = month.strip().lower()
-        if raw.isdigit():
-            month_int = int(raw)
-        else:
-            name_map = {
-                name.lower(): index
-                for index, name in enumerate(calendar.month_name)
-                if name
-            }
-            abbr_map = {
-                name.lower(): index
-                for index, name in enumerate(calendar.month_abbr)
-                if name
-            }
-            if raw in name_map:
-                month_int = name_map[raw]
-            elif raw in abbr_map:
-                month_int = abbr_map[raw]
-            else:
-                raise ValueError(f"Invalid month: {month}")
-
-    if not 1 <= month_int <= 12:
-        raise ValueError(f"Invalid month: {month}")
-    return month_int
-
-
-def _month_label(month: int) -> str:
-    return calendar.month_abbr[month].lower()
-
-
-def _parquet_row_count(path: Path) -> int:
-    if not path.exists():
-        return 0
-    return int(pl.read_parquet(path, columns=["timestamp"]).height)
-
-
-_SYMBOL_PATTERN = re.compile(r"^[a-z0-9]+-[a-z0-9]+$")
-
-
-def _iter_dirs(path: Path) -> list[str]:
-    if not path.exists():
-        return []
-    return sorted(item.name for item in path.iterdir() if item.is_dir())
-
-
-def _is_symbol_name(name: str) -> bool:
-    return bool(_SYMBOL_PATTERN.fullmatch(name))
-
-
-def _discover_symbols(base_path: Path, symbols: list[str]) -> list[str]:
-    if symbols:
-        return symbols
-    return [name for name in _iter_dirs(base_path) if _is_symbol_name(name)]
-
-
-def _discover_timeframes(symbol_path: Path, timeframes: list[str]) -> list[str]:
-    if timeframes:
-        return timeframes
-    return _iter_dirs(symbol_path)
-
-
-def _discover_years(timeframe_path: Path, years: list[int | str]) -> list[str]:
-    if years:
-        return [str(year) for year in years]
-    return _iter_dirs(timeframe_path)
-
-
-def _discover_months(year_path: Path, months: list[int | str]) -> list[int]:
-    if months:
-        return [month_to_int(month) for month in months]
-    if not year_path.exists():
-        return []
-    month_numbers: set[int] = set()
-    for parquet_path in year_path.glob("*.parquet"):
-        if parquet_path.stem.isdigit():
-            month_numbers.add(int(parquet_path.stem))
-    return sorted(month_numbers)
-
-
-def parquet_coverage_report(
-    base_path: Path,
-    symbols: Iterable[str] | None = None,
-    years: Iterable[int | str] | None = None,
-    months: Iterable[int | str] | None = None,
-    timeframes: Iterable[str] | None = None,
-) -> pl.DataFrame:
-    """Return a DataFrame with parquet row coverage by month."""
-    rows: list[dict[str, object]] = []
-
-    symbol_list = list(symbols or [])
-    timeframe_list = list(timeframes or [])
-    year_list = list(years or [])
-    month_list = list(months or [])
-
-    for symbol in _discover_symbols(Path(base_path), symbol_list):
-        symbol_path = Path(base_path) / symbol
-        for timeframe in _discover_timeframes(symbol_path, timeframe_list):
-            timeframe_path = symbol_path / timeframe
-            for year_str in _discover_years(timeframe_path, year_list):
-                year_path = timeframe_path / year_str
-                year_int = int(year_str)
-                for month_int in _discover_months(year_path, month_list):
-                    month_name = _month_label(month_int)
-                    file_path = year_path / f"{month_int:02d}.parquet"
-                    row_count = _parquet_row_count(file_path)
-                    max_possible = expected_rows_for_month(
-                        year_int, month_int, timeframe
-                    )
-                    ratio_raw = _safe_div(row_count, max_possible)
-                    ratio = math.floor(ratio_raw * 100) / 100
-                    rows.append(
-                        {
-                            "symbol": symbol,
-                            "year": year_str,
-                            "month": month_name,
-                            "timeframe": timeframe,
-                            "row_count": row_count,
-                            "max_possible": max_possible,
-                            "ratio": ratio,
-                        }
-                    )
-
-    return pl.DataFrame(rows)
+def _floor_2(value: float) -> float:
+    return math.floor(value * 100) / 100
 
 
 __all__ = [
-    "SparsitySeriesStats",
-    "expected_rows_for_month",
-    "month_to_int",
-    "parquet_coverage_report",
-    "sparsity_for_column",
-    "sparsity_for_series",
-    "sparsity_report",
+    "build_ohlcv_sparsity_report",
     "timeframe_to_minutes",
 ]
