@@ -8,6 +8,7 @@ from pathlib import Path
 
 import polars as pl
 
+from src.data.utils import sparsity as sparsity_module
 from src.data.utils.sparsity import build_ohlcv_sparsity_report
 
 
@@ -156,3 +157,42 @@ def test_build_ohlcv_sparsity_report_floors_float_metrics(tmp_path: Path) -> Non
     assert row["expected"] == 1000
     assert row["availability"] == 0.99
     assert row["sparsity"] == 0.0
+
+
+def test_build_ohlcv_sparsity_report_falls_back_when_batch_read_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Fall back to per-file read path when batch parquet read fails."""
+    base_path = tmp_path / "ohlcv"
+    asset_path = base_path / "btc-usdc" / "1m" / "2026"
+    _write_ts_parquet(
+        asset_path / "01.parquet",
+        [datetime(2026, 1, 1, 0, 0, tzinfo=UTC)],
+    )
+    _write_ts_parquet(
+        asset_path / "02.parquet",
+        [datetime(2026, 1, 1, 0, 1, tzinfo=UTC)],
+    )
+
+    original_read_parquet = sparsity_module.pl.read_parquet
+
+    def _read_parquet_with_forced_batch_failure(source, *args, **kwargs):
+        if isinstance(source, list):
+            raise RuntimeError("forced batch failure")
+        return original_read_parquet(source, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sparsity_module.pl,
+        "read_parquet",
+        _read_parquet_with_forced_batch_failure,
+    )
+
+    report = build_ohlcv_sparsity_report(base_path)
+    assert report.shape == (1, 15)
+    row = report.row(0, named=True)
+    assert row["asset"] == "btc-usdc"
+    assert row["timeframe"] == "1m"
+    assert row["files_processed"] == 2
+    assert row["actual"] == 2
+    assert row["expected"] == 2
+    assert row["missing"] == 0

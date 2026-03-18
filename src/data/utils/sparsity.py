@@ -6,6 +6,7 @@ import logging
 import math
 import re
 from datetime import UTC, datetime
+from numbers import Real
 from pathlib import Path
 
 import polars as pl
@@ -134,8 +135,7 @@ def _build_asset_rows(asset_path: Path, asset: str) -> list[dict[str, object]]:
 def _build_timeframe_row(
     asset: str, timeframe_path: Path, timeframe: str
 ) -> dict[str, object] | None:
-    epoch_chunks: list[pl.Series] = []
-    files_processed = 0
+    month_files: list[Path] = []
     for year_dir in _iter_dirs(timeframe_path):
         year_name = year_dir.name
         if not _YEAR_PATTERN.fullmatch(year_name):
@@ -179,14 +179,11 @@ def _build_timeframe_row(
                     )
                 continue
 
-            epoch_series = _read_timestamp_epoch_us(month_file)
-            if epoch_series is None:
-                continue
-            files_processed += 1
-            if epoch_series.len() > 0:
-                epoch_chunks.append(epoch_series)
+            month_files.append(month_file)
 
-    if not epoch_chunks:
+    combined, files_processed = _read_timestamp_epoch_us_many(month_files)
+
+    if combined is None or combined.len() == 0:
         if files_processed > 0:
             logger.warning(
                 "no valid timestamps found for %s/%s (processed %d files)",
@@ -196,7 +193,6 @@ def _build_timeframe_row(
             )
         return None
 
-    combined = pl.concat(epoch_chunks)
     unique = combined.unique().sort()
     actual = int(unique.len())
     raw_count = int(combined.len())
@@ -228,12 +224,16 @@ def _build_timeframe_row(
         largest_gap_missing: int | None = None
         avg_extra_gap_seconds = 0.0
     else:
-        gap_missing = (gap_deltas // cadence_us) - 1
-        avg_gap_missing = _floor_2(float(gap_missing.mean() or 0.0))
-        shortest_gap_missing = int(gap_missing.min())
-        largest_gap_missing = int(gap_missing.max())
-        extra_gap_seconds = (gap_deltas - cadence_us) / 1_000_000
-        avg_extra_gap_seconds = _floor_2(float(extra_gap_seconds.mean() or 0.0))
+        gap_missing = ((gap_deltas // cadence_us) - 1).cast(pl.Int64)
+        gap_missing_mean = gap_missing.mean()
+        avg_gap_missing = _floor_2(_coerce_float(gap_missing_mean))
+        gap_missing_min = gap_missing.min()
+        gap_missing_max = gap_missing.max()
+        shortest_gap_missing = _coerce_int(gap_missing_min)
+        largest_gap_missing = _coerce_int(gap_missing_max)
+        extra_gap_seconds = ((gap_deltas - cadence_us) / 1_000_000).cast(pl.Float64)
+        extra_gap_mean = extra_gap_seconds.mean()
+        avg_extra_gap_seconds = _floor_2(_coerce_float(extra_gap_mean))
 
     return {
         "asset": asset,
@@ -252,6 +252,53 @@ def _build_timeframe_row(
         "largest_gap_missing": largest_gap_missing,
         "avg_extra_gap_seconds": avg_extra_gap_seconds,
     }
+
+
+def _read_timestamp_epoch_us_many(parquet_files: list[Path]) -> tuple[pl.Series | None, int]:
+    if not parquet_files:
+        return None, 0
+
+    try:
+        frame = pl.read_parquet(parquet_files, columns=["timestamp"])
+    except Exception:
+        return _read_timestamp_epoch_us_many_fallback(parquet_files)
+
+    if "timestamp" not in frame.columns:
+        return _read_timestamp_epoch_us_many_fallback(parquet_files)
+
+    raw_series = frame.get_column("timestamp")
+    non_null_before = raw_series.len() - raw_series.null_count()
+    epoch_series = _timestamp_to_epoch_us(raw_series, parquet_files[0])
+    if epoch_series is None:
+        return _read_timestamp_epoch_us_many_fallback(parquet_files)
+
+    non_null_after = epoch_series.len() - epoch_series.null_count()
+    invalid_values = max(non_null_before - non_null_after, 0)
+    if invalid_values > 0:
+        logger.warning(
+            "invalid timestamp values across %d files: %d values ignored",
+            len(parquet_files),
+            invalid_values,
+        )
+    return epoch_series.drop_nulls().cast(pl.Int64), len(parquet_files)
+
+
+def _read_timestamp_epoch_us_many_fallback(
+    parquet_files: list[Path],
+) -> tuple[pl.Series | None, int]:
+    epoch_chunks: list[pl.Series] = []
+    files_processed = 0
+    for parquet_file in parquet_files:
+        epoch_series = _read_timestamp_epoch_us(parquet_file)
+        if epoch_series is None:
+            continue
+        files_processed += 1
+        if epoch_series.len() > 0:
+            epoch_chunks.append(epoch_series)
+
+    if not epoch_chunks:
+        return pl.Series(values=[], dtype=pl.Int64), files_processed
+    return pl.concat(epoch_chunks), files_processed
 
 
 def _read_timestamp_epoch_us(parquet_file: Path) -> pl.Series | None:
@@ -313,6 +360,18 @@ def _iter_dirs(path: Path) -> list[Path]:
 
 def _safe_div(numerator: int, denominator: int) -> float:
     return float(numerator) / float(denominator) if denominator else 0.0
+
+
+def _coerce_float(value: object | None) -> float:
+    if isinstance(value, Real):
+        return float(value)
+    return 0.0
+
+
+def _coerce_int(value: object | None) -> int:
+    if isinstance(value, Real):
+        return int(float(value))
+    return 0
 
 
 def _floor_2(value: float) -> float:
