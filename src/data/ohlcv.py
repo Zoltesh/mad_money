@@ -363,6 +363,7 @@ class CoinbaseDataClient:
             use_shared_progress: Whether to use shared progress.
             candles_so_far: Number of candles fetched so far.
             expected_candles: Expected total candles.
+            activity_state: Shared aggregate activity counters for batch fetches.
 
         Returns:
             Updated pending_advance count (0 if flushed, else same as input).
@@ -405,6 +406,7 @@ class CoinbaseDataClient:
             progress_tracker: Individual ProgressTracker instance.
             use_shared_progress: Whether to use shared progress.
             extra: Additional count to add to the advance (default 0).
+            activity_state: Shared aggregate activity counters for batch fetches.
         """
         total_advance = pending_advance + extra
         if use_shared_progress and shared_progress is not None and total_advance > 0:
@@ -430,12 +432,26 @@ class CoinbaseDataClient:
         if shared_progress is None or activity_state is None:
             return
 
-        activity_state["active"] = max(0, activity_state["active"] + active_delta)
+        previous_active = activity_state["active"]
+        previous_completed = activity_state["completed"]
+        previous_failed = activity_state["failed"]
+
+        activity_state["active"] = max(0, previous_active + active_delta)
         activity_state["completed"] = min(
             activity_state["total"],
-            activity_state["completed"] + advance,
+            previous_completed + advance,
         )
-        activity_state["failed"] = activity_state["failed"] + failed_increment
+        activity_state["failed"] = max(0, previous_failed + failed_increment)
+
+        # Avoid no-op renders that can create duplicate aggregate status lines in
+        # terminals that do not fully support Rich's in-place redraw behavior.
+        if (
+            advance == 0
+            and activity_state["active"] == previous_active
+            and activity_state["completed"] == previous_completed
+            and activity_state["failed"] == previous_failed
+        ):
+            return
 
         shared_progress.update(
             activity_state["task_id"],

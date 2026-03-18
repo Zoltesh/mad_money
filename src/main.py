@@ -64,10 +64,10 @@ async def main():
         enable_intra_combo_concurrency=True,
     ) as client:
         await client.fetch_multiple_and_save(
-            symbols=["PEPE/USDC"],
+            symbols=FAV_SYMBOLS,
             timeframes=TIMEFRAMES,
-            start_date="2024-04-01",
-            end_date="2025-12-31",
+            start_date="2026-01-01",
+            end_date="2026-02-28",
         )
 
 

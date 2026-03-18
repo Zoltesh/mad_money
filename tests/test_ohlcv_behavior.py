@@ -582,3 +582,55 @@ def test_activity_progress_tracks_active_completed_and_failed():
     assert activity_state["failed"] == 1
     assert shared_progress.update.call_count == 2
     assert shared_progress.update.call_args_list[-1].kwargs["advance"] == 2
+
+
+def test_activity_progress_skips_noop_updates():
+    """No-op activity updates should not trigger redundant renders."""
+    client = CoinbaseDataClient()
+    shared_progress = MagicMock()
+    activity_state = {
+        "task_id": 99,
+        "active": 0,
+        "completed": 0,
+        "failed": 0,
+        "total": 10,
+    }
+
+    client._update_activity_progress(
+        shared_progress,
+        activity_state,
+        active_delta=-1,
+    )
+
+    shared_progress.update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fetch_concurrent_bounded_recovers_retryable_failed_window():
+    """A retry-exhausted window should be retried again for gap refill."""
+    client = CoinbaseDataClient(
+        batch_concurrency=3,
+        min_request_interval=0.0,
+    )
+    expected_start = int(datetime(2024, 1, 1, 0, 0, tzinfo=UTC).timestamp() * 1000)
+    batch_span_ms = 300 * 60 * 1000  # 300 candles x 1m timeframe
+    failed_window_start = expected_start + batch_span_ms
+    attempts_by_since: dict[int, int] = {}
+
+    async def mock_fetch_batch(_exchange, _semaphore, _symbol, _timeframe, since):
+        attempts_by_since[since] = attempts_by_since.get(since, 0) + 1
+        if since == failed_window_start and attempts_by_since[since] == 1:
+            raise ccxt.RequestTimeout("Simulated transient timeout")
+        return [[since + (i * 60_000), 1.0, 1.0, 1.0, 1.0, 1.0] for i in range(300)]
+
+    with patch.object(client, "_get_exchange", return_value=object()):
+        with patch.object(client, "_fetch_batch", side_effect=mock_fetch_batch):
+            result = await client.fetch(
+                symbol="BTC/USD",
+                timeframe="1m",
+                start_date="2024-01-01 00:00:00",
+                end_date="2024-01-01 12:00:00",
+            )
+
+    assert attempts_by_since.get(failed_window_start, 0) >= 2
+    assert len(result) == 721
