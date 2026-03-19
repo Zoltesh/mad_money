@@ -3,9 +3,9 @@
 from src.data.ohlcv import OHLCV_SCHEMA, CoinbaseDataClient, Verbosity
 from src.data.progress import (
     TIMEFRAME_SECONDS,
+    ProgressTracker,
     calculate_expected_batches,
     get_progress_color,
-    ProgressTracker,
 )
 
 __all__ = [
