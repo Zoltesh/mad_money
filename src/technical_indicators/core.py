@@ -186,14 +186,31 @@ def add_indicator(
             )
 
         window_size = timeframe_ratio(timeframe, base_timeframe)
+        original_columns = set(df.columns)
+        synthetic_cols = [
+            f"high_{timeframe}",
+            f"low_{timeframe}",
+            f"close_{timeframe}",
+        ]
 
         # Build synthetic OHLC columns (e.g., high_15m, low_15m, close_15m)
         df_with_synthetic = _synthetic_ohlc(df, window_size, timeframe)
 
         # Compute indicator on synthetic candles
-        return _compute_indicator(
+        result = _compute_indicator(
             df_with_synthetic, indicator_def, params, timeframe, use_synthetic=True
         )
+
+        # Synthetic OHLC columns are temporary helper inputs for higher-timeframe
+        # indicators and should not leak into the returned feature set.
+        helper_cols_to_drop = [
+            col
+            for col in synthetic_cols
+            if col not in original_columns and col in result.columns
+        ]
+        if helper_cols_to_drop:
+            return result.drop(helper_cols_to_drop)
+        return result
 
 
 def add_indicators(

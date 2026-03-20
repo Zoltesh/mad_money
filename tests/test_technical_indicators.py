@@ -221,37 +221,21 @@ def test_add_indicator_base_timeframe_bbands() -> None:
 
 
 def test_add_indicator_synthetic_ohlc_values() -> None:
-    """Synthetic 15m OHLC correctness: high=rolling_max(3), low=rolling_min(3), close=current."""
+    """Higher-timeframe helper OHLC columns stay internal to indicator computation."""
     df = _sample_ohlcv_df(n=12)
 
     result = add_indicator(
         df, "rsi", timeframe="15m", base_timeframe="5m", timeperiod=3
     )
 
-    # Build expected synthetic columns using same rolling logic
-    expected_high = df.select(pl.col("high").rolling_max(3).alias("high_15m"))
-    expected_low = df.select(pl.col("low").rolling_min(3).alias("low_15m"))
-
-    # Verify rolling max for high
-    assert_frame_equal(
-        result.select("high_15m"),
-        expected_high,
-    )
-    # Verify rolling min for low
-    assert_frame_equal(
-        result.select("low_15m"),
-        expected_low,
-    )
-    # Verify close is unchanged (current close)
-    assert_frame_equal(
-        result.select("close_15m"),
-        df.select(pl.col("close").alias("close_15m")),
-    )
+    # Synthetic helper columns should not leak into user-facing output.
+    assert "high_15m" not in result.columns
+    assert "low_15m" not in result.columns
+    assert "close_15m" not in result.columns
+    # Indicator column still computed.
+    assert "rsi_3_15m" in result.columns
     # Invariant: row count preserved
     assert len(result) == len(df)
-    # Invariant: synthetic high >= synthetic low where both non-null
-    synthetic = result.select(["high_15m", "low_15m"]).drop_nulls()
-    assert (synthetic["high_15m"] >= synthetic["low_15m"]).all()
 
 
 def test_add_indicator_smaller_timeframe_raises() -> None:

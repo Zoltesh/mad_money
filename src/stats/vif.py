@@ -19,7 +19,9 @@ def _validate_input(df: pl.DataFrame, drop_na: bool) -> pl.DataFrame:
     non_numeric = [c for c in df.columns if c not in numeric_cols]
 
     if non_numeric:
-        raise ValueError(f"non-numeric columns found: {non_numeric}")
+        import warnings
+
+        warnings.warn(f"non-numeric columns found and skipped: {non_numeric}")
 
     if len(numeric_cols) < 2:
         raise ValueError("VIF requires at least 2 features")
