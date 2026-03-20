@@ -22,7 +22,6 @@ Example usage:
     >>> df_with_features = add_indicators(df, indicators, base_timeframe="5m")
 """
 
-from src.technical_indicators.adx import add_adx
 from src.technical_indicators.core import add_indicator, add_indicators
 from src.technical_indicators.registry import (
     INDICATOR_REGISTRY,
@@ -40,8 +39,6 @@ __all__ = [
     # Core functions
     "add_indicator",
     "add_indicators",
-    # Convenience functions
-    "add_adx",
     # Registry
     "INDICATOR_REGISTRY",
     "IndicatorDef",

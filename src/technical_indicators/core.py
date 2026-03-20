@@ -177,6 +177,14 @@ def add_indicator(
         )
     else:
         # Higher timeframe - construct synthetic candles
+        if "volume" in indicator_def.inputs:
+            raise ValueError(
+                f"Indicator '{indicator}' with timeframe '{timeframe}' requires volume, "
+                f"but synthetic higher-timeframe volume aggregation is not yet supported. "
+                f"Use base timeframe '{base_timeframe}' for volume-input indicators, "
+                f"or use an OHLC-only indicator for higher timeframes."
+            )
+
         window_size = timeframe_ratio(timeframe, base_timeframe)
 
         # Build synthetic OHLC columns (e.g., high_15m, low_15m, close_15m)

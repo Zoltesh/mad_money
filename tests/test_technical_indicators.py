@@ -55,3 +55,56 @@ def test_add_indicator_sorts_unsorted_input_before_computing() -> None:
 
     # Function guarantees chronological calculations and returns chronological rows.
     assert_frame_equal(out_from_unsorted, out_from_sorted)
+
+
+def test_add_indicator_synthetic_volume_indicator_mfi_raises_value_error() -> None:
+    """Synthetic MFI request raises ValueError with clear unsupported message."""
+    df = _sample_ohlcv_df(n=20)
+
+    with pytest.raises(ValueError, match="requires volume.*not yet supported"):
+        add_indicator(df, "mfi", timeframe="15m", base_timeframe="5m", timeperiod=14)
+
+
+def test_add_indicator_synthetic_volume_indicator_ad_raises_value_error() -> None:
+    """Synthetic AD request raises ValueError with clear unsupported message."""
+    df = _sample_ohlcv_df(n=20)
+
+    with pytest.raises(ValueError, match="requires volume.*not yet supported"):
+        add_indicator(df, "ad", timeframe="15m", base_timeframe="5m")
+
+
+def test_add_indicator_synthetic_volume_indicator_adosc_raises_value_error() -> None:
+    """Synthetic ADOSC request raises ValueError with clear unsupported message."""
+    df = _sample_ohlcv_df(n=20)
+
+    with pytest.raises(ValueError, match="requires volume.*not yet supported"):
+        add_indicator(
+            df,
+            "adosc",
+            timeframe="15m",
+            base_timeframe="5m",
+            fastperiod=3,
+            slowperiod=10,
+        )
+
+
+def test_add_indicator_base_timeframe_volume_indicator_succeeds() -> None:
+    """Base-timeframe MFI still computes successfully."""
+    df = _sample_ohlcv_df(n=20)
+
+    result = add_indicator(
+        df, "mfi", timeframe="5m", base_timeframe="5m", timeperiod=14
+    )
+
+    assert "mfi_14_5m" in result.columns
+
+
+def test_add_indicator_synthetic_timeframe_adx() -> None:
+    """Synthetic ADX (OHLC-only) still works after volume guard."""
+    df = _sample_ohlcv_df(n=20)
+
+    result = add_indicator(
+        df, "adx", timeframe="15m", base_timeframe="5m", timeperiod=14
+    )
+
+    assert "adx_14_15m" in result.columns
