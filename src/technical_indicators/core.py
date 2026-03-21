@@ -82,10 +82,48 @@ def _synthetic_ohlc(
     Returns:
         DataFrame with additional synthetic columns.
     """
-    return df.with_columns(
-        pl.col("high").rolling_max(window_size).alias(f"high_{prefix}"),
-        pl.col("low").rolling_min(window_size).alias(f"low_{prefix}"),
-        pl.col("close").alias(f"close_{prefix}"),
+    row_col = "__row_idx"
+    bucket_col = "__bucket_idx"
+    completed_bucket_col = "__completed_bucket_idx"
+    bucket_high_col = "__bucket_high"
+    bucket_low_col = "__bucket_low"
+    bucket_close_col = "__bucket_close"
+
+    indexed = (
+        df.with_row_index(row_col)
+        .with_columns(
+            (pl.col(row_col) // window_size).alias(bucket_col),
+            (((pl.col(row_col) + 1) // window_size) - 1).alias(completed_bucket_col),
+        )
+        .with_columns(pl.col(completed_bucket_col).cast(pl.Int64))
+    )
+
+    bucket_agg = indexed.group_by(bucket_col).agg(
+        pl.col("high").max().alias(bucket_high_col),
+        pl.col("low").min().alias(bucket_low_col),
+        pl.col("close").last().alias(bucket_close_col),
+    )
+
+    return (
+        indexed.join(
+            bucket_agg,
+            left_on=completed_bucket_col,
+            right_on=bucket_col,
+            how="left",
+        )
+        .with_columns(
+            pl.col(bucket_high_col).alias(f"high_{prefix}"),
+            pl.col(bucket_low_col).alias(f"low_{prefix}"),
+            pl.col(bucket_close_col).alias(f"close_{prefix}"),
+        )
+        .drop(
+            row_col,
+            bucket_col,
+            completed_bucket_col,
+            bucket_high_col,
+            bucket_low_col,
+            bucket_close_col,
+        )
     )
 
 

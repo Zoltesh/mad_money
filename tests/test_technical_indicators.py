@@ -280,6 +280,60 @@ def test_add_indicators_batch_different_timeframes() -> None:
     assert len(result) == len(df)
 
 
+def test_add_indicators_close_only_higher_timeframe_differs_from_base() -> None:
+    """Higher-timeframe close-only indicators should not duplicate base signal."""
+    start = datetime(2025, 1, 1, tzinfo=UTC)
+    close = [
+        100.0,
+        102.0,
+        99.0,
+        103.0,
+        98.0,
+        104.0,
+        97.0,
+        105.0,
+        96.0,
+        106.0,
+        95.0,
+        107.0,
+        94.0,
+        108.0,
+        93.0,
+        109.0,
+        92.0,
+        110.0,
+    ]
+    df = pl.DataFrame(
+        {
+            "timestamp": [start + timedelta(minutes=5 * i) for i in range(len(close))],
+            "open": close,
+            "high": [c + 1.0 for c in close],
+            "low": [c - 1.0 for c in close],
+            "close": close,
+            "volume": [1000.0 + i for i in range(len(close))],
+        }
+    )
+
+    result = add_indicators(
+        df,
+        [
+            ("rsi", "5m", {"timeperiod": 3}),
+            ("rsi", "15m", {"timeperiod": 3}),
+        ],
+        base_timeframe="5m",
+    )
+
+    comparable = result.filter(
+        pl.col("rsi_3_5m").is_not_null() & pl.col("rsi_3_15m").is_not_null()
+    )
+    assert len(comparable) > 0
+
+    has_difference = comparable.select(
+        (pl.col("rsi_3_5m") - pl.col("rsi_3_15m")).abs().gt(1e-9).any()
+    ).item()
+    assert has_difference is True
+
+
 def test_add_indicators_batch_with_synthetic_volume_indicator_raises() -> None:
     """Batch path propagates deterministic ValueError for synthetic volume indicators."""
     df = _sample_ohlcv_df(n=30)
