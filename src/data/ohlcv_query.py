@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import polars as pl
 
@@ -23,6 +24,11 @@ OHLCV_SCHEMA = {
 def _empty_ohlcv_frame() -> pl.DataFrame:
     """Return an empty OHLCV-shaped DataFrame."""
     return pl.DataFrame(schema=OHLCV_SCHEMA)
+
+
+def _empty_ohlcv_lazyframe() -> pl.LazyFrame:
+    """Return an empty OHLCV-shaped LazyFrame."""
+    return _empty_ohlcv_frame().lazy()
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -108,6 +114,81 @@ def _file_month_key(file_path: Path) -> tuple[int, int]:
     return int(file_path.parent.name), int(file_path.stem)
 
 
+def _resolve_ohlcv_range_files(
+    data_dir: str,
+    symbol: str,
+    timeframe: str,
+    start: str | datetime | None = None,
+    end: str | datetime | None = None,
+) -> tuple[list[Path], datetime | None, datetime | None]:
+    """Resolve parquet files and aligned datetime bounds for a range query."""
+    if timeframe not in TIMEFRAME_SECONDS:
+        raise ValueError(
+            f"Unsupported timeframe: {timeframe}. "
+            f"Supported: {sorted(TIMEFRAME_SECONDS.keys())}"
+        )
+
+    start_dt = _parse_datetime(start) if start is not None else None
+    end_dt = (
+        _floor_to_timeframe(_parse_datetime(end, end_of_day=True), timeframe)
+        if end is not None
+        else None
+    )
+
+    if start_dt is not None and end_dt is not None and start_dt > end_dt:
+        raise ValueError("start must be less than or equal to end after alignment")
+
+    pair_path = _normalize_symbol(symbol)
+    base_path = Path(data_dir) / "coinbase" / "ohlcv" / pair_path / timeframe
+    if not base_path.exists():
+        return [], start_dt, end_dt
+
+    partition_files = _list_partition_files(base_path)
+    if not partition_files:
+        return [], start_dt, end_dt
+
+    if start_dt is not None:
+        start_key = (start_dt.year, start_dt.month)
+    else:
+        start_key = _file_month_key(partition_files[0])
+
+    if end_dt is not None:
+        end_key = (end_dt.year, end_dt.month)
+    else:
+        end_key = _file_month_key(partition_files[-1])
+
+    selected_files = [
+        path
+        for path in partition_files
+        if start_key <= _file_month_key(path) <= end_key
+    ]
+    return selected_files, start_dt, end_dt
+
+
+def lazy_load_ohlcv_range(
+    data_dir: str,
+    symbol: str,
+    timeframe: str,
+    start: str | datetime | None = None,
+    end: str | datetime | None = None,
+) -> pl.LazyFrame:
+    """Lazily load locally stored OHLCV rows for a symbol/timeframe range."""
+    selected_files, start_dt, end_dt = _resolve_ohlcv_range_files(
+        data_dir=data_dir, symbol=symbol, timeframe=timeframe, start=start, end=end
+    )
+    if not selected_files:
+        return _empty_ohlcv_lazyframe()
+
+    lazy = pl.scan_parquet([str(path) for path in selected_files]).sort("timestamp")
+    lazy = lazy.unique(subset=["timestamp"], keep="last").sort("timestamp")
+
+    if start_dt is not None:
+        lazy = lazy.filter(pl.col("timestamp") >= pl.lit(start_dt))
+    if end_dt is not None:
+        lazy = lazy.filter(pl.col("timestamp") <= pl.lit(end_dt))
+    return lazy
+
+
 def load_ohlcv_range(
     data_dir: str,
     symbol: str,
@@ -137,59 +218,9 @@ def load_ohlcv_range(
         ...     end="2026-02-28T23:59:59",
         ... )
     """
-    if timeframe not in TIMEFRAME_SECONDS:
-        raise ValueError(
-            f"Unsupported timeframe: {timeframe}. "
-            f"Supported: {sorted(TIMEFRAME_SECONDS.keys())}"
-        )
-
-    start_dt = _parse_datetime(start) if start is not None else None
-    end_dt = (
-        _floor_to_timeframe(_parse_datetime(end, end_of_day=True), timeframe)
-        if end is not None
-        else None
+    return cast(
+        pl.DataFrame,
+        lazy_load_ohlcv_range(
+            data_dir=data_dir, symbol=symbol, timeframe=timeframe, start=start, end=end
+        ).collect(),
     )
-
-    if start_dt is not None and end_dt is not None and start_dt > end_dt:
-        raise ValueError("start must be less than or equal to end after alignment")
-
-    pair_path = _normalize_symbol(symbol)
-    base_path = Path(data_dir) / "coinbase" / "ohlcv" / pair_path / timeframe
-    if not base_path.exists():
-        return _empty_ohlcv_frame()
-
-    partition_files = _list_partition_files(base_path)
-    if not partition_files:
-        return _empty_ohlcv_frame()
-
-    if start_dt is not None:
-        start_key = (start_dt.year, start_dt.month)
-    else:
-        start_key = _file_month_key(partition_files[0])
-
-    if end_dt is not None:
-        end_key = (end_dt.year, end_dt.month)
-    else:
-        end_key = _file_month_key(partition_files[-1])
-
-    selected_files = [
-        path
-        for path in partition_files
-        if start_key <= _file_month_key(path) <= end_key
-    ]
-    if not selected_files:
-        return _empty_ohlcv_frame()
-
-    data_frames = [pl.read_parquet(path) for path in selected_files]
-    if not data_frames:
-        return _empty_ohlcv_frame()
-
-    combined = pl.concat(data_frames).sort("timestamp")
-    combined = combined.unique(subset=["timestamp"], keep="last").sort("timestamp")
-
-    if start_dt is not None:
-        combined = combined.filter(pl.col("timestamp") >= pl.lit(start_dt))
-    if end_dt is not None:
-        combined = combined.filter(pl.col("timestamp") <= pl.lit(end_dt))
-
-    return combined

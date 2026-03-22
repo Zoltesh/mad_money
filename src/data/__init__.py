@@ -1,7 +1,7 @@
 """Data module for OHLCV retrieval."""
 
 from src.data.ohlcv import OHLCV_SCHEMA, CoinbaseDataClient, Verbosity
-from src.data.ohlcv_query import load_ohlcv_range
+from src.data.ohlcv_query import lazy_load_ohlcv_range, load_ohlcv_range
 from src.data.progress import (
     TIMEFRAME_SECONDS,
     ProgressTracker,
@@ -18,4 +18,5 @@ __all__ = [
     "get_progress_color",
     "ProgressTracker",
     "load_ohlcv_range",
+    "lazy_load_ohlcv_range",
 ]

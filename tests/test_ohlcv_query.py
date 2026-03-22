@@ -1,11 +1,13 @@
 """Tests for standalone local OHLCV range querying."""
 
 from datetime import UTC, datetime
+from typing import cast
 
+import polars as pl
 import pytest
 
 from src.data import CoinbaseDataClient
-from src.data.ohlcv_query import load_ohlcv_range
+from src.data.ohlcv_query import lazy_load_ohlcv_range, load_ohlcv_range
 
 
 def test_load_ohlcv_range_loads_all_when_unbounded(tmp_path, sample_df_factory):
@@ -167,6 +169,51 @@ def test_load_ohlcv_range_returns_empty_ohlcv_frame_for_missing_data(tmp_path):
         data_dir=str(tmp_path),
         symbol="AAVE/USDC",
         timeframe="5m",
+    )
+
+    assert loaded.is_empty()
+    assert loaded.columns == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+def test_lazy_load_ohlcv_range_matches_eager_results(tmp_path, sample_df_factory):
+    """Lazy and eager range queries should produce identical materialized results."""
+    client = CoinbaseDataClient(data_dir=str(tmp_path))
+    df = sample_df_factory(
+        datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
+        datetime(2024, 1, 1, 0, 5, tzinfo=UTC),
+        datetime(2024, 1, 1, 0, 10, tzinfo=UTC),
+    )
+    client.save(df, "AAVE/USDC", "5m")
+
+    eager = load_ohlcv_range(
+        data_dir=str(tmp_path),
+        symbol="AAVE/USDC",
+        timeframe="5m",
+        start="2024-01-01T00:05:00",
+        end="2024-01-01T00:10:00",
+    )
+    lazy = lazy_load_ohlcv_range(
+        data_dir=str(tmp_path),
+        symbol="AAVE/USDC",
+        timeframe="5m",
+        start="2024-01-01T00:05:00",
+        end="2024-01-01T00:10:00",
+    )
+    lazy_df = cast(pl.DataFrame, lazy.collect())
+
+    assert isinstance(lazy, pl.LazyFrame)
+    assert eager.equals(lazy_df)
+
+
+def test_lazy_load_ohlcv_range_returns_empty_for_missing_data(tmp_path):
+    """Missing partitions should return an empty OHLCV-shaped LazyFrame."""
+    loaded = cast(
+        pl.DataFrame,
+        lazy_load_ohlcv_range(
+            data_dir=str(tmp_path),
+            symbol="AAVE/USDC",
+            timeframe="5m",
+        ).collect(),
     )
 
     assert loaded.is_empty()
